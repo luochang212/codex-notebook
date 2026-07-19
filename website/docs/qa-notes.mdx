@@ -8,8 +8,8 @@ import Link from '@docusaurus/Link';
 
 这里不是把源码按目录复述一遍，而是把每个关键问题整理成一个章节。每章都分成两层：
 
-- **架构层**：讲清楚问题背后的取舍、张力和心智模型。
-- **源码层**：给出可以继续深入的文件、函数和执行链路。
+- **架构层**：讲清楚问题背后的层级边界、取舍和需要修正的直觉。
+- **源码层**：直接呈现支撑判断的关键源码切片，而不是只列入口。
 
 所有章节默认针对 `openai/codex` 代码库；如果某个问题涉及外部文档、产品行为或其他实现，需要在章节开头单独声明。
 
@@ -19,12 +19,12 @@ import Link from '@docusaurus/Link';
   <Link className="qaIndexCard" to="/qa/context-collection">
     <span>Question 01</span>
     <strong>一次 query 后，Codex 如何构造模型上下文？</strong>
-    <p>从 turn input、additional context、world-state baseline、显式扩展激活和 for_prompt 投影拆解上下文构造链路。</p>
+    <p>回答上下文是否连续、是否累积、如何判断相关：从 turn input、additional context、world-state baseline、显式扩展激活和 for_prompt 投影拆解。</p>
   </Link>
   <Link className="qaIndexCard" to="/qa/prompt-cache-compaction">
     <span>Question 02</span>
-    <strong>缓存命中和上下文压缩是不是互相矛盾？</strong>
-    <p>拆解 prompt cache 与 compaction 的张力，以及 Codex 的窗口级取舍。</p>
+    <strong>缓存命中和上下文压缩如何协作？</strong>
+    <p>澄清 provider prompt cache 与本地 compaction 的层级差异，解释为什么 Codex 采用窗口级接力而不是缓存片段替换。</p>
   </Link>
 </div>
 
@@ -33,10 +33,10 @@ import Link from '@docusaurus/Link';
 每个章节保留同一组信息结构，便于后续继续追加：
 
 - **原始问题**：保留提问原话。
-- **调研主题**：把问题抽象成可研究的架构主题。
+- **调研主题**：把问题抽象成可继续验证的架构主题。
 - **当前结论**：给出当前基于源码阅读的具体判断。
-- **架构张力**：说明为什么这个问题不是简单的是/否。
-- **交互视图**：用标签页查看判断、机制、证据和追问。
+- **架构边界**：说明这个问题涉及哪些层级，以及哪些直觉需要修正。
+- **交互视图**：只在能帮助理解时使用，不为了版式硬凑字段。
 - **关键源码切片**：直接呈现高信息密度源码或注明出处的伪代码。
 
 ## 待继续追踪的问题池

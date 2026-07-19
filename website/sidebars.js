@@ -27,12 +27,12 @@ const sidebars = {
         {
           type: 'doc',
           id: 'qa/context-collection',
-          label: '01. 上下文构造',
+          label: '01. query 上下文构造',
         },
         {
           type: 'doc',
           id: 'qa/prompt-cache-compaction',
-          label: '02. 缓存与压缩',
+          label: '02. 缓存命中与压缩',
         },
       ],
     },

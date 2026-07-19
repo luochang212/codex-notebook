@@ -39,6 +39,34 @@ html[data-theme='dark'] {
   color: var(--ifm-font-color-base);
 }
 
+.originalQuestionBox {
+  background:
+    linear-gradient(135deg, rgba(139, 73, 61, 0.1), transparent 50%),
+    var(--ifm-card-background-color);
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 14px;
+  margin: 1rem 0 1.5rem;
+  padding: 1.4rem;
+}
+
+.originalQuestionLabel {
+  color: var(--ifm-color-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.originalQuestionBox blockquote {
+  background: transparent;
+  border: 0;
+  color: var(--ifm-font-color-base);
+  font-size: 1.04rem;
+  margin: 0.65rem 0 0;
+  padding: 0;
+}
+
 .theme-code-block-highlighted-line {
   background-color: rgba(139, 73, 61, 0.12);
   display: block;
