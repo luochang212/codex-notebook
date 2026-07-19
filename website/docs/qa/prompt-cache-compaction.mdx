@@ -1,0 +1,226 @@
+---
+id: prompt-cache-compaction
+title: 缓存命中和上下文压缩是不是互相矛盾？
+sidebar_label: 02. 缓存与压缩
+---
+
+import ResearchQuestion from '@site/src/components/ResearchQuestion';
+
+<ResearchQuestion
+  number="02"
+  originalQuestion="缓存命中和压缩是一对矛盾吧，你想想我们的对话历史可以通过缓存命中，但是这个是完整的历史。如果我们要压缩历史上下文，也就意味着需要抛弃缓存命中，换成这些压缩后的上下文，它是如何做到精确选择缓存命中，将这些缓存命中替换成压缩后的上下文？回答我的问题，当然如果我的问题本身带有错误认知，你也需要指正"
+  theme="Prompt cache 喜欢稳定长前缀，compaction 会改写历史前缀。Codex 如何在二者之间做窗口级取舍？"
+  thesis="缓存命中和压缩确实有张力，但 Codex 不做片段级缓存替换；它在 compaction 时结束旧窗口，安装 replacement_history，让压缩后的新历史成为后续 turn 的新稳定前缀。"
+  stakes="这个问题揭示了 Codex 在成本、延迟、上下文容量和历史语义完整性之间的底层取舍。"
+  tension={{
+    left: '完整连续历史更容易复用稳定 prompt prefix，也让模型保留更多工作记忆。',
+    right: '长历史会耗尽 context window，必须压缩或开启新窗口，否则后续任务无法继续。',
+    verdict: 'Codex 在窗口健康优先时接受旧缓存损失，然后用 replacement_history 和 window metadata 重建新的缓存友好前缀。',
+  }}
+  mechanisms={[
+    {
+      title: '正常 turn 依赖稳定前缀',
+      body: '上下文 diff 和历史 append 让 prompt 前缀尽量稳定，provider-side prompt cache 更容易命中。',
+    },
+    {
+      title: 'compaction 不是局部替换',
+      body: '压缩完成后，replace_compacted_history 会整体替换 ContextManager 历史，而不是选择某些 cache hit 片段再做手术式替换。',
+    },
+    {
+      title: 'replacement_history 成为新窗口',
+      body: '新历史通常由必要 initial context、保留的最近用户消息和 compaction summary 构成。',
+    },
+    {
+      title: 'window id 与 prefill 记录窗口边界',
+      body: 'AutoCompactWindow 维护 window_number、window_id 和 prefill_input_tokens，用于后续 token budget 和窗口增长计算。',
+    },
+    {
+      title: 'cached_input_tokens 是观测，不是规划器',
+      body: 'Codex 会记录服务端返回的 cached_input_tokens 和 cache_write_input_tokens，但没有看到用它们做片段级缓存替换规划。',
+    },
+  ]}
+  tradeoffs={[
+    {
+      gain: '实现简单、边界清晰，压缩后的历史可持久化、可恢复、可回放。',
+      cost: '压缩发生时可能牺牲旧 prompt prefix 的缓存收益。',
+    },
+    {
+      gain: '新窗口重新建立稳定前缀，后续 turn 又能逐步获得缓存收益。',
+      cost: '刚压缩后的第一次或前几次请求可能不像旧历史那样缓存友好。',
+    },
+    {
+      gain: 'replacement_history 让 resume/fork/rollback 的语义更清楚。',
+      cost: '摘要质量成为长期会话准确性的关键风险点。',
+    },
+    {
+      gain: 'BodyAfterPrefix 可以避免稳定前缀本身反复触发 auto compact。',
+      cost: '这只是 token budget 口径，不等于保留旧 provider cache。',
+    },
+  ]}
+  evidence={[
+    {
+      path: 'core/src/compact.rs::run_compact_task_inner_impl',
+      note: 'local compaction 的主流程，采样摘要后构造新历史。',
+    },
+    {
+      path: 'core/src/compact.rs::build_compacted_history',
+      note: '选择最近用户消息并追加 summary，形成 replacement history。',
+    },
+    {
+      path: 'core/src/session/mod.rs::replace_compacted_history',
+      note: '整体替换内存历史并持久化 CompactedItem / WorldState / TurnContext baseline。',
+    },
+    {
+      path: 'core/src/session/mod.rs::start_new_context_window',
+      note: 'token-budget compaction 路径：直接启动新 context window。',
+    },
+    {
+      path: 'core/src/state/auto_compact_window.rs::AutoCompactWindow',
+      note: '维护 window id、previous window 和 prefill_input_tokens。',
+    },
+  ]}
+  followups={[
+    'Codex 是否可以设计 prefix-preserving compaction 来尽量保留缓存？',
+    'AutoCompactTokenLimitScope::BodyAfterPrefix 对缓存友好性到底有多大帮助？',
+    'remote compaction 和 local compaction 在 replacement_history 质量上有什么差异？',
+    'compaction summary 的位置为什么会影响模型训练预期？',
+  ]}
+/>
+
+## 关键源码切片
+
+这章只引用能证明“窗口级替换，而非缓存片段手术”的源码。
+
+### 1. token budget 不是缓存命中率驱动
+
+出处：`codex-rs/core/src/session/context_window.rs::context_window_token_status`
+
+```rust
+let (auto_compact_scope_tokens, auto_compact_scope_limit, auto_compact_window_prefill_tokens) =
+    match turn_context.config.model_auto_compact_token_limit_scope {
+        AutoCompactTokenLimitScope::Total => (
+            active_context_tokens,
+            turn_context.model_info.auto_compact_token_limit(),
+            None,
+        ),
+        AutoCompactTokenLimitScope::BodyAfterPrefix => {
+            let window = sess.auto_compact_window_snapshot().await;
+            let baseline = window.prefill_input_tokens.unwrap_or(active_context_tokens);
+            (
+                active_context_tokens.saturating_sub(baseline),
+                scope_limit,
+                window.prefill_input_tokens,
+            )
+        }
+    };
+```
+
+这段证明 compaction 的触发口径是 token window，而不是“哪些 prompt 片段已经缓存命中”。`BodyAfterPrefix` 只是让预算计算扣掉稳定前缀，不是复用旧 provider cache 的片段级算法。
+
+### 2. compaction 构造新的 replacement history
+
+出处：`codex-rs/core/src/compact.rs::run_compact_task_inner_impl`
+
+```rust
+let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+let user_messages = collect_user_messages(history_items);
+
+let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+
+let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+
+let (initial_context, world_state_baseline) = build_compaction_initial_context(...).await;
+if !initial_context.is_empty() {
+    new_history =
+        insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
+}
+
+let compacted_item = CompactedItem {
+    message: summary_text.clone(),
+    replacement_history: Some(new_history.clone()),
+    window_number: Some(window_number),
+    window_id: Some(window_ids.window_id.to_string()),
+    ...
+};
+
+sess.replace_compacted_history(..., new_history, ..., compacted_item).await;
+sess.recompute_token_usage(&turn_context).await;
+```
+
+这段直接推翻“精确选择缓存命中再替换”的模型。Codex 做的是：
+
+```text
+旧 history → summary + selected user messages → new_history
+advance_auto_compact_window()
+replace_compacted_history(new_history)
+```
+
+### 3. selected user messages + summary 是新历史主体
+
+出处：`codex-rs/core/src/compact.rs::build_compacted_history_with_limit`
+
+```rust
+for message in user_messages.iter().rev() {
+    if remaining == 0 {
+        break;
+    }
+    let tokens = approx_token_count(&message.message);
+    if tokens <= remaining {
+        selected_messages.push(message.clone());
+        remaining = remaining.saturating_sub(tokens);
+    } else {
+        let truncated = truncate_text(&message.message, TruncationPolicy::Tokens(remaining));
+        selected_messages.push(CompactedUserMessage { message: truncated, ... });
+        break;
+    }
+}
+selected_messages.reverse();
+
+for message in &selected_messages {
+    history.push(ResponseItem::Message { role: "user".to_string(), ... });
+}
+
+history.push(ResponseItem::Message {
+    role: "user".to_string(),
+    content: vec![ContentItem::InputText { text: summary_text }],
+    ...
+});
+```
+
+这段说明 replacement history 的构造策略是“最近用户消息预算 + 摘要”，不是“保留缓存命中片段”。
+
+### 4. 历史被整体替换，并建立新 baseline
+
+出处：`codex-rs/core/src/session/mod.rs::replace_compacted_history`
+
+```rust
+let compacted_item = CompactedItem {
+    replacement_history: Some(items.clone()),
+    ..compacted_item
+};
+
+{
+    let mut state = self.state.lock().await;
+    state.replace_history(items, reference_context_item.clone());
+    if let Some(world_state) = world_state_baseline {
+        let snapshot = world_state.snapshot();
+        world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
+        state.history.set_world_state_baseline(snapshot);
+    }
+}
+
+self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)]).await;
+if let Some(world_state_item) = world_state_item {
+    self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)]).await;
+}
+if let Some(turn_context_item) = reference_context_item {
+    self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)]).await;
+}
+```
+
+这段是本章最关键的证据：`state.replace_history(...)` 是整体替换。随后持久化 `CompactedItem`、完整 `WorldState` baseline 和 `TurnContext` baseline，说明 compaction 不是局部编辑旧 prompt，而是安装一个新的历史窗口。
+
+## 本章结论
+
+你的问题抓住了真实张力：压缩会改变 prompt 前缀，旧缓存价值会下降。但需要修正的是“精确选择缓存命中并替换”的想象。Codex 当前更像是窗口级策略：旧窗口缓存收益用到不能再用时，切到压缩后的新窗口，再让新窗口逐渐变成稳定前缀。

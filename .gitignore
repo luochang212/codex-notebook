@@ -1,0 +1,11 @@
+.DS_Store
+.env
+node_modules/
+
+website/node_modules/
+website/build/
+website/.docusaurus/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

@@ -1,0 +1,274 @@
+.chapterShell {
+  --chapter-ink: #201d19;
+  --chapter-muted: #625d55;
+  --chapter-line: #ded3c3;
+  --chapter-paper: #fffdf8;
+  --chapter-tint: #f4e5df;
+  --chapter-accent: #8b493d;
+  display: grid;
+  gap: 1.5rem;
+}
+
+[data-theme='dark'] .chapterShell {
+  --chapter-ink: #f5eee6;
+  --chapter-muted: #c7b9aa;
+  --chapter-line: #463b33;
+  --chapter-paper: #211d19;
+  --chapter-tint: #33241f;
+  --chapter-accent: #d28a77;
+}
+
+.hero {
+  border-bottom: 1px solid var(--chapter-line);
+  padding: 1.5rem 0 2rem;
+}
+
+.issueNumber,
+.sectionLabel {
+  color: var(--chapter-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.theme {
+  color: var(--chapter-muted);
+  font-size: 1.05rem;
+  margin: 0.85rem 0 0;
+  max-width: 68ch;
+}
+
+.originalQuestion {
+  background:
+    linear-gradient(135deg, rgba(139, 73, 61, 0.1), transparent 50%),
+    var(--chapter-paper);
+  border: 1px solid var(--chapter-line);
+  border-radius: 14px;
+  padding: 1.4rem;
+}
+
+.originalQuestion blockquote {
+  background: transparent;
+  border: 0;
+  color: var(--chapter-ink);
+  font-size: 1.04rem;
+  margin: 0.65rem 0 0;
+  padding: 0;
+}
+
+.thesisGrid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.thesisCard {
+  background: var(--chapter-paper);
+  border: 1px solid var(--chapter-line);
+  border-radius: 14px;
+  padding: 1.25rem;
+}
+
+.thesisCard p {
+  color: var(--chapter-muted);
+  margin: 0.65rem 0 0;
+}
+
+.tensionPanel {
+  align-items: stretch;
+  background: var(--chapter-ink);
+  border-radius: 16px;
+  color: var(--chapter-paper);
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  padding: 1.25rem;
+}
+
+.tensionPanel p {
+  color: color-mix(in srgb, var(--chapter-paper) 78%, transparent);
+  margin: 0.55rem 0 0;
+}
+
+.tensionDivider {
+  align-self: center;
+  border: 1px solid color-mix(in srgb, var(--chapter-paper) 18%, transparent);
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--chapter-paper) 78%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.55rem;
+}
+
+.verdict {
+  border-top: 1px solid color-mix(in srgb, var(--chapter-paper) 18%, transparent);
+  grid-column: 1 / -1;
+  padding-top: 1rem;
+}
+
+.verdict span {
+  color: #f1c7b7;
+  display: block;
+  font-weight: 700;
+  margin-bottom: 0.2rem;
+}
+
+.interactivePanel {
+  background: var(--chapter-paper);
+  border: 1px solid var(--chapter-line);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.tabRail {
+  background: var(--chapter-tint);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  position: relative;
+}
+
+.tabRail button {
+  background: transparent;
+  border: 0;
+  color: var(--chapter-muted);
+  cursor: pointer;
+  font-weight: 700;
+  padding: 0.95rem 0.75rem 1.05rem;
+}
+
+.tabRail button:hover,
+.tabRail button:focus-visible,
+.tabRail .activeTab {
+  color: var(--chapter-ink);
+}
+
+.progressTrack {
+  background: color-mix(in srgb, var(--chapter-line) 65%, transparent);
+  bottom: 0;
+  height: 3px;
+  left: 0;
+  position: absolute;
+  right: 0;
+}
+
+.progressTrack span {
+  background: var(--chapter-accent);
+  display: block;
+  height: 100%;
+  transition: width 180ms ease;
+}
+
+.tabContent {
+  padding: 1.25rem;
+}
+
+.tradeoffGrid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.tradeoffCard {
+  border: 1px solid var(--chapter-line);
+  border-radius: 12px;
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+}
+
+.tradeoffCard div {
+  padding: 1rem;
+}
+
+.tradeoffCard div:first-child {
+  background: rgba(97, 120, 79, 0.12);
+}
+
+.tradeoffCard div:last-child {
+  background: rgba(139, 73, 61, 0.09);
+  border-top: 1px solid var(--chapter-line);
+}
+
+.tradeoffCard span,
+.evidenceRow code {
+  color: var(--chapter-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.tradeoffCard p,
+.evidenceRow p,
+.mechanismList p {
+  color: var(--chapter-muted);
+  margin: 0.35rem 0 0;
+}
+
+.mechanismList {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.mechanismList details {
+  border: 1px solid var(--chapter-line);
+  border-radius: 12px;
+  padding: 0.95rem 1rem;
+}
+
+.mechanismList summary {
+  align-items: center;
+  color: var(--chapter-ink);
+  cursor: pointer;
+  display: flex;
+  font-weight: 750;
+  gap: 0.65rem;
+}
+
+.mechanismList summary span {
+  color: var(--chapter-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.evidenceList {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.evidenceRow {
+  border-bottom: 1px solid var(--chapter-line);
+  padding-bottom: 0.85rem;
+}
+
+.evidenceRow:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.followupList {
+  color: var(--chapter-muted);
+  margin: 0;
+  padding-left: 1.35rem;
+}
+
+.followupList li + li {
+  margin-top: 0.65rem;
+}
+
+@media (max-width: 760px) {
+  .thesisGrid,
+  .tradeoffGrid,
+  .tensionPanel {
+    grid-template-columns: 1fr;
+  }
+
+  .tensionDivider {
+    justify-self: start;
+  }
+
+  .tabRail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -1,0 +1,415 @@
+---
+id: context-collection
+title: 一次 query 后，Codex 如何构造模型上下文？
+sidebar_label: 01. 上下文构造
+---
+
+> 原始问题：
+>
+> 我希望你另开新章节，回答一些问题，也是用html的方式。我想知道每个对话发生后，codex是如何收集与这次query有关的上下文的？它收集的上下文的连续的吗？有没有特殊的累积机制？如何区别什么上下文与当前的query有关，什么与当前query无关
+
+## 先回答
+
+Codex 不是在每次 query 后做一轮“语义检索”，然后把检索结果拼进 prompt。更接近真实实现的说法是：
+
+```text
+用户输入 / additional_context
+→ 写入 turn input
+→ capture_step_context
+→ 根据 baseline 注入 full context 或 diff
+→ 根据当前 user input 显式激活 skills/plugins/apps
+→ 进入连续 history
+→ 每次采样前 clone_history().for_prompt(...)
+```
+
+所以它的上下文是**连续的**，但不是“无限追加的原始聊天记录”。它有几层控制：
+
+- `ContextManager.items` 保存模型可见历史。
+- `reference_context_item` 控制 turn settings / context 是否需要 full reinjection。
+- `world_state_baseline` 控制 world state 是 full 还是 patch。
+- `AdditionalContextStore` 对客户端附加上下文做 keyed diff。
+- `build_skills_and_plugins` 只从当前 user input 提取显式 mention。
+- `for_prompt` 在每次采样前规范化历史，并按模型能力剥离不支持的媒体。
+- compaction / rollback 会重写或截断 history。
+
+这里最容易误解的是“相关性”。Codex 当前没有一个全局的“当前 query 相关性分类器”。它主要用**来源和边界**决定什么进入上下文：当前用户输入天然进入；客户端显式提供的 additional context 进入；world state 按配置和变化进入；skills/plugins/apps 由显式 mention 和 extension contributor 触发；旧历史默认因线程连续性保留，直到被压缩、回滚或规范化处理。
+
+## 1. 用户输入先变成 turn input，不是直接拼 prompt
+
+没有 active turn 时，新输入会创建 regular task；有 active turn 时，同轮追加会走 `steer_input`，进入 pending input queue。两条路径都先处理 `additional_context`。
+
+### 新 turn：additional_context 先 keyed merge，再和用户输入一起 spawn task
+
+出处：`codex-rs/core/src/session/handlers.rs`
+
+```rust
+let additional_context_input = {
+    let mut state = sess.state.lock().await;
+    state.additional_context.merge(additional_context)
+};
+let mut task_input = additional_context_input
+    .into_iter()
+    .map(ResponseItem::from)
+    .map(TurnInput::ResponseItem)
+    .collect::<Vec<_>>();
+if !items.is_empty() {
+    task_input.push(TurnInput::UserInput {
+        content: items,
+        client_id: client_user_message_id,
+    });
+}
+sess.spawn_task(
+    Arc::clone(&current_context),
+    task_input,
+    crate::tasks::RegularTask::new(),
+)
+```
+
+这段说明：query 不是直接变成 prompt 文本。它先变成结构化的 `TurnInput`，其中客户端附加上下文被转成 `ResponseItem`，用户输入被保留为 `TurnInput::UserInput`。
+
+### 同轮追加：steer input 进入 pending queue
+
+出处：`codex-rs/core/src/session/mod.rs::steer_input`
+
+```rust
+let additional_context_input = {
+    let mut state = self.state.lock().await;
+    state.additional_context.merge(additional_context)
+};
+
+let mut pending_input = additional_context_input
+    .into_iter()
+    .map(ResponseItem::from)
+    .map(TurnInput::ResponseItem)
+    .collect::<Vec<_>>();
+pending_input.push(TurnInput::UserInput {
+    content: input,
+    client_id: client_user_message_id,
+});
+self.input_queue
+    .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+        active_turn.turn_state.as_ref(),
+        pending_input,
+    )
+    .await;
+```
+
+这解释了为什么用户在模型运行中继续输入，Codex 不一定要等下一个完整 turn。它可以把 steer 输入放进当前 turn 的 pending queue，后续采样前再 drain 进 history。
+
+## 2. additional_context 的“相关性”由客户端 key 和信任等级决定
+
+`AdditionalContextStore` 不做语义判断。它只做两件事：
+
+1. 同一个 key 的值没变，就不重复注入。
+2. 根据 kind 决定进入 user fragment 还是 developer fragment。
+
+出处：`codex-rs/core/src/state/additional_context.rs::AdditionalContextStore::merge`
+
+```rust
+let fragments = values
+    .iter()
+    .filter(|(key, value)| self.values.get(*key) != Some(*value))
+    .map(|(key, entry)| match entry.kind {
+        AdditionalContextKind::Untrusted => {
+            AdditionalContextUserFragment::new(key.clone(), entry.value.clone())
+                .into_response_input_item()
+        }
+        AdditionalContextKind::Application => {
+            AdditionalContextDeveloperFragment::new(key.clone(), entry.value.clone())
+                .into_response_input_item()
+        }
+    })
+    .collect();
+self.values = values;
+```
+
+这个设计很克制：Codex 没有替 IDE 判断“selection 是否真的相关”。IDE/app 如果认为当前 selection、diagnostics、文件摘要、任务元数据相关，就通过 `additional_context` 提供；Codex 负责去重、分层和信任边界。
+
+## 3. 连续历史、context baseline、world-state baseline 是同一个状态对象
+
+上下文的连续性不只是“保留聊天记录”。`ContextManager` 同时保存历史和两个 diff 基线。
+
+出处：`codex-rs/core/src/context_manager/history.rs::ContextManager`
+
+```rust
+pub(crate) struct ContextManager {
+    /// The oldest items are at the beginning of the vector.
+    items: Vec<ResponseItem>,
+    /// Bumped whenever history is rewritten, such as compaction or rollback.
+    history_version: u64,
+    token_info: Option<TokenUsageInfo>,
+    /// Reference context snapshot used for diffing and producing model-visible
+    /// settings update items.
+    reference_context_item: Option<TurnContextItem>,
+    /// World state most recently appended to model-visible history.
+    world_state_baseline: Option<WorldStateSnapshot>,
+}
+```
+
+这几个字段一起回答了“有没有特殊累积机制”：
+
+| 字段 | 作用 |
+| --- | --- |
+| `items` | 连续模型历史，保存可发给模型的 `ResponseItem` |
+| `history_version` | compaction / rollback 等重写历史时递增 |
+| `reference_context_item` | turn settings / context diff 的参照点 |
+| `world_state_baseline` | world state patch 的参照点 |
+
+## 4. 不是每轮完整注入：首轮 full，稳态 diff
+
+上下文更新的承重逻辑在 `record_context_updates_and_set_reference_context_item`。
+
+出处：`codex-rs/core/src/session/mod.rs::record_context_updates_and_set_reference_context_item`
+
+```rust
+let reference_context_item = {
+    let state = self.state.lock().await;
+    state.reference_context_item()
+};
+let turn_context_item = turn_context.to_turn_context_item();
+let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
+let should_inject_full_context = reference_context_item.is_none();
+let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+// Full initial context resets the baseline; later turns persist only its changes.
+let (mut context_items, world_state_item) = if should_inject_full_context {
+    let context_items = self
+        .build_initial_context_with_world_state_and_mcp(
+            turn_context,
+            world_state.as_ref(),
+            step_context.mcp.as_ref(),
+        )
+        .await;
+    let snapshot = world_state.snapshot();
+    self.state
+        .lock()
+        .await
+        .history
+        .set_world_state_baseline(snapshot.clone());
+    (
+        context_items,
+        Some(WorldStateItem::full(snapshot.into_value())),
+    )
+} else {
+    let mut context_items = self
+        .build_settings_update_items(reference_context_item.as_ref(), turn_context)
+        .await;
+    let (world_state_items, world_state_item) = {
+        let mut state = self.state.lock().await;
+        let (fragments, rollout_item) =
+            state.history.update_world_state(world_state.as_ref());
+        (
+            crate::context_manager::updates::merge_contextual_fragments(fragments),
+            rollout_item,
+        )
+    };
+    context_items.extend(world_state_items);
+    (context_items, world_state_item)
+};
+```
+
+这段源码说明得很清楚：
+
+- 如果没有 `reference_context_item`，Codex 认为没有可靠 baseline，于是注入完整 initial context。
+- 如果 baseline 存在，Codex 只追加 settings update 和 world-state diff。
+- 这不是为了“少写 prompt”这么简单，而是为了让历史增长、cache 稳定性、resume/replay 的可恢复性都能被同一个 baseline 机制约束。
+
+## 5. world state 是运行时状态，不是聊天内容
+
+Codex 的“上下文”里有很大一部分不是用户说过的话，而是当前运行环境的制度状态。
+
+出处：`codex-rs/core/src/session/world_state.rs::build_world_state_for_step`
+
+```rust
+let mut world_state = WorldState::default();
+world_state.add_section(RealtimeState::new(
+    turn_context.realtime_active,
+    turn_context
+        .config
+        .experimental_realtime_start_instructions
+        .as_deref(),
+));
+world_state.add_section(AgentsMdState::new(step_context.loaded_agents_md.as_deref()));
+if turn_context.config.include_permissions_instructions {
+    let permission_profile = turn_context.permission_profile();
+    let exec_policy = self.services.exec_policy.current();
+    world_state.add_section(PermissionsState::new(
+        &permission_profile,
+        turn_context.approval_policy.value(),
+        ApprovalPromptContext::new(...),
+        exec_policy.as_ref(),
+        &turn_context.cwd,
+        ...
+    ));
+}
+if turn_context.config.include_collaboration_mode_instructions
+    && let Some(collaboration_mode) =
+        CollaborationModeState::from_collaboration_mode(&turn_context.collaboration_mode())
+{
+    world_state.add_section(collaboration_mode);
+}
+if turn_context.config.include_environment_context {
+    world_state.add_section(
+        EnvironmentsState::from_turn_context_with_environments(
+            turn_context,
+            &step_context.environments,
+        )
+        .with_subagents(environment_subagents),
+    );
+}
+```
+
+这解释了为什么“上下文收集”不能理解成“找一些和 query 相关的文本”。Codex 还要让模型知道：
+
+- 当前 realtime 状态。
+- 当前 AGENTS.md 指令。
+- 当前权限、审批、sandbox、exec policy。
+- 当前 collaboration mode。
+- 当前环境和 subagent 信息。
+
+这些信息是否相关，不是由当前 query 的语义匹配决定，而是由“模型要在这个运行时里安全行动”决定。
+
+## 6. 当前 query 只显式激活部分扩展能力
+
+skills/plugins/apps 的注入不是全量常驻。`build_skills_and_plugins` 只从当前 `TurnInput::UserInput` 提取显式 mention。
+
+出处：`codex-rs/core/src/session/turn.rs::build_skills_and_plugins`
+
+```rust
+let user_input = input
+    .iter()
+    .filter_map(|item| match item {
+        TurnInput::UserInput { content, .. } => Some(content.as_slice()),
+        TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+    })
+    .flatten()
+    .cloned()
+    .collect::<Vec<_>>();
+
+let mentioned_plugins =
+    collect_explicit_plugin_mentions(&user_input, loaded_plugins.capability_summaries());
+
+let extension_injection_items =
+    build_extension_turn_input_items(sess, turn_context, &user_input, cancellation_token)
+        .await?;
+
+let mentioned_skills = collect_explicit_skill_mentions(
+    &user_input,
+    &skills_outcome.skills,
+    &skills_outcome.disabled_paths,
+    &connector_slug_counts,
+);
+
+let skill_items: Vec<ResponseItem> = skill_injections
+    .iter()
+    .map(|skill| ContextualUserFragment::into(crate::context::SkillInstructions::from(skill)))
+    .collect();
+let plugin_items =
+    build_plugin_injections(&mentioned_plugins, &mcp_tools, &available_connectors);
+let mut explicitly_enabled_connectors = collect_explicit_app_ids(&user_input);
+```
+
+这段代码非常关键：Codex 没有说“当前 query 语义上像某个 skill，所以自动注入”。它主要看显式 mention 和 extension contributor 的输出。这是一种可预测性优先的选择。
+
+## 7. extension contributor 只拿到受限的 turn input
+
+扩展可以贡献 turn-scoped context，但它拿到的是受限输入，不是整个无限历史。
+
+出处：`codex-rs/core/src/session/turn.rs::build_extension_turn_input_items`
+
+```rust
+let input = TurnInputContext {
+    turn_id: turn_context.sub_id.to_string(),
+    user_input: user_input.to_vec(),
+    environments,
+};
+
+let mut items = Vec::new();
+for contributor in contributors {
+    let contributed_fragments = contributor
+        .contribute(
+            input.clone(),
+            &sess.services.session_extension_data,
+            &sess.services.thread_extension_data,
+            turn_context.extension_data.as_ref(),
+        )
+        .or_cancel(cancellation_token)
+        .await
+        .ok()?;
+    items.extend(
+        contributed_fragments
+            .into_iter()
+            .map(ContextualUserFragment::into_boxed_response_item),
+    );
+}
+```
+
+这进一步说明“相关性”是分域委托的：core 不做一个总控语义分类器；extension 可以基于当前 turn input 和环境选择贡献什么，但贡献结果仍被包装成 contextual fragments。
+
+## 8. 最终发给模型的是 history 的规范化视图
+
+每次采样前，Codex 都从连续 history 克隆一份，经过 `for_prompt` 规范化后发给模型。
+
+出处：`codex-rs/core/src/session/turn.rs::run_turn`
+
+```rust
+world_state = sess
+    .record_step_world_state_if_changed(&world_state, step_context.as_ref())
+    .await;
+
+// Construct the input that we will send to the model.
+let sampling_request_input: Vec<ResponseItem> = async {
+    sess.clone_history()
+        .await
+        .for_prompt(&turn_context.model_info.input_modalities)
+}
+.instrument(trace_span!("run_turn.prepare_sampling_request_input"))
+.await;
+
+run_sampling_request(
+    Arc::clone(&sess),
+    Arc::clone(&step_context),
+    Arc::clone(&turn_extension_data),
+    Arc::clone(&turn_diff_tracker),
+    &mut client_session,
+    &responses_metadata,
+    sampling_request_input,
+    cancellation_token.child_token(),
+)
+.await
+```
+
+`for_prompt` 本身也不是 no-op。
+
+出处：`codex-rs/core/src/context_manager/history.rs`
+
+```rust
+/// Returns the history prepared for sending to the model. This applies a proper
+/// normalization and drops un-suited items. Unsupported image and audio content
+/// is stripped from messages and tool outputs according to `input_modalities`.
+pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+    self.normalize_history(input_modalities);
+    self.items
+}
+```
+
+所以答案是：模型看到的是连续 history 的**请求时投影**，不是原始 history 本体。
+
+## 如何判断“相关”和“无关”
+
+Codex 不是按一个统一算法判断相关性，而是按来源分层：
+
+| 来源 | 进入条件 | 相关性模型 |
+| --- | --- | --- |
+| 当前用户输入 | 用户本轮提交 | 天然相关 |
+| 历史消息 / 工具结果 | 已在 thread history 中，未被压缩/回滚/过滤 | 线程连续性相关 |
+| world state | 配置允许，且 full injection 或 diff 有变化 | 运行时安全与行为约束相关 |
+| additional_context | 客户端提供，且 key/value 变化 | 调用端负责相关性，Codex 负责去重和信任边界 |
+| skills/plugins/apps | 当前 user input 显式 mention 或 extension 贡献 | 显式激活相关 |
+| pending steer/mailbox | active turn 接受 pending input | 同轮后续采样相关 |
+| unsupported media / orphan tool output | `for_prompt` normalization 剥离 | 与模型能力不匹配，被过滤 |
+
+## 本章结论
+
+“每次 query 后收集相关上下文”这个说法本身有一点误导。Codex 更像是在维护一个持续演化的模型上下文账本：当前 query 只是触发新 turn、显式扩展和 additional context merge 的入口；真正发给模型的是连续 history、运行时 world state、diff baseline、扩展注入和规范化投影共同形成的请求视图。
+
+这套设计的取舍也很明确：它牺牲了“模型自动语义召回一切相关材料”的想象空间，换来更可预测的上下文边界、更稳定的 prompt 前缀、更容易恢复的 rollout，以及更清晰的 trusted/untrusted 分层。

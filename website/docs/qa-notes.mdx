@@ -1,0 +1,46 @@
+---
+id: qa-notes
+title: Codex 架构问答
+sidebar_label: 问答索引
+---
+
+import Link from '@docusaurus/Link';
+
+这里不是把源码按目录复述一遍，而是把每个关键问题整理成一个章节。每章都分成两层：
+
+- **架构层**：讲清楚问题背后的取舍、张力和心智模型。
+- **源码层**：给出可以继续深入的文件、函数和执行链路。
+
+## 章节
+
+<div className="qaIndexGrid">
+  <Link className="qaIndexCard" to="/qa/context-collection">
+    <span>Question 01</span>
+    <strong>一次 query 后，Codex 如何构造模型上下文？</strong>
+    <p>从 turn input、additional context、world-state baseline、显式扩展激活和 for_prompt 投影拆解上下文构造链路。</p>
+  </Link>
+  <Link className="qaIndexCard" to="/qa/prompt-cache-compaction">
+    <span>Question 02</span>
+    <strong>缓存命中和上下文压缩是不是互相矛盾？</strong>
+    <p>拆解 prompt cache 与 compaction 的张力，以及 Codex 的窗口级取舍。</p>
+  </Link>
+</div>
+
+## 记录格式
+
+每个章节保留同一组信息结构，便于后续继续追加：
+
+- **原始问题**：保留提问原话。
+- **调研主题**：把问题抽象成可研究的架构主题。
+- **当前结论**：给出当前基于源码阅读的具体判断。
+- **架构张力**：说明为什么这个问题不是简单的是/否。
+- **交互视图**：用标签页查看判断、机制、证据和追问。
+- **关键源码切片**：直接呈现高信息密度源码或注明出处的伪代码。
+
+## 待继续追踪的问题池
+
+- Codex 的 world state 为什么选择 diff，而不是每轮完整注入？
+- 为什么 rollback 会影响 `reference_context_item`？
+- Codex 如何在 “model-visible context” 和 “UI-visible transcript” 之间做投影？
+- ToolRouter 的工具曝光策略是否会造成模型能力的非确定性？
+- app-server v2 的 API 设计如何保护未来兼容性？
