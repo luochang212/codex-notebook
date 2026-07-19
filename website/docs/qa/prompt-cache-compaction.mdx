@@ -16,7 +16,7 @@ sidebar_label: 02. 缓存命中与压缩
 这里有一个需要修正的前提：Codex 不是先“精准识别哪些历史片段已经缓存命中”，再把这些片段替换成压缩后的上下文。源码里更接近真实实现的模型是：
 
 ```mermaid
-flowchart LR
+flowchart TD
   A["正常 turn<br/>连续 history + 稳定 prefix"] --> B["provider 可能命中 prompt cache"]
   B --> C{"token budget / context window<br/>是否出现压力"}
   C -->|否| A
