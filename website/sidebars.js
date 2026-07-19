@@ -34,6 +34,11 @@ const sidebars = {
           id: 'qa/codex-architecture-overview',
           label: '03. 整体架构与复杂度',
         },
+        {
+          type: 'doc',
+          id: 'qa/skill-mechanism',
+          label: '04. skill 发现与调用',
+        },
       ],
     },
   ],
