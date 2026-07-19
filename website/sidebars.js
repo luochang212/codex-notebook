@@ -4,7 +4,7 @@ const sidebars = {
     {
       type: 'doc',
       id: 'intro',
-      label: '项目简介',
+      label: 'Codex 问答笔记',
     },
     {
       type: 'category',
