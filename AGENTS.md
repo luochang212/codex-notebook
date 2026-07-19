@@ -2,6 +2,8 @@
 
 本仓库是一个 Codex 架构问答笔记站点。站点使用 Docusaurus，结构参考 `luochang212/DL-Demos` 的 `website/` 子项目。
 
+默认研究对象是 `openai/codex` 代码库。除非用户明确要求扩展到其他项目或产品文档，否则所有架构判断、源码引用和伪代码都必须回到该代码库验证。
+
 ## 项目结构
 
 - `website/`：Docusaurus 站点源码。
@@ -33,30 +35,22 @@ npm run build
 
 构建通过才算完成。`node --localstorage-file` 相关 experimental warning 可以忽略，只要 Docusaurus build 成功即可。
 
-## 本地环境与提交身份
+## 本地环境
 
-本仓库允许使用 `.env` 保存本地提交身份，避免 Git 自动使用带本机 hostname 的邮箱。
+本仓库允许使用 `.env` 保存本地私有配置。
 
 - `.env`：本地私有文件，不提交。
 - `.env.example`：提交到仓库，只保留字段结构。
 
-提交或 amend 前，优先加载 `.env`：
-
-```bash
-set -a
-source .env
-set +a
-git commit -m "..."
-```
-
 `.env` 应至少包含：
 
 ```bash
-GIT_AUTHOR_NAME=
-GIT_AUTHOR_EMAIL=
-GIT_COMMITTER_NAME=
-GIT_COMMITTER_EMAIL=
+CODEX_SOURCE_DIR=
 ```
+
+`CODEX_SOURCE_DIR` 指向本机可用的 `openai/codex` 源码仓库。涉及 Codex 源码判断时，优先从这个路径核对源码；不要把该本机绝对路径写进文档正文或提交内容。
+
+提交身份不要放在 `.env` 中。需要避免 Git 自动使用带本机 hostname 的邮箱时，应设置本仓库的 local git config，例如 `git config user.name ...` 和 `git config user.email ...`。提交后必须检查 commit metadata。
 
 不要把本机用户名、hostname、本机绝对路径、私人邮箱写进提交元数据或文档正文。
 
@@ -215,7 +209,7 @@ let first_step_context = sess.capture_step_context(...).await;
 
 1. 先确认用户最新反馈，避免继续沿用旧方向。
 2. 如果修改已有章节，先阅读该章节当前内容。
-3. 如果涉及 Codex 源码判断，应回到本机可用的 Codex 源码仓库核对源码，不要凭记忆写；不要把本机绝对路径写进文档。
+3. 如果涉及 Codex 源码判断，应优先从 `.env` 的 `CODEX_SOURCE_DIR` 指向的源码仓库核对源码，不要凭记忆写；不要把本机绝对路径写进文档。
 4. 使用 `apply_patch` 修改文件。
 5. 修改后运行 `cd website && npm run build`。
 6. 最终回复说明改了哪些文件，以及构建是否通过。

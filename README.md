@@ -2,6 +2,7 @@
 
 Codex Notebook 是一个使用 Docusaurus 搭建的 Codex 架构问答笔记站点，框架结构参考 `luochang212/DL-Demos`：
 
+- 研究对象：`openai/codex`
 - 站点源码位于 `website/`
 - 文档入口位于 `website/docs/intro.mdx`
 - 问答索引位于 `website/docs/qa-notes.mdx`

@@ -77,7 +77,7 @@ const config = {
         {
           name: 'description',
           content:
-            'Codex 问答笔记把关键问题整理成可继续深挖的架构研究主题，覆盖上下文管理、压缩、缓存、工具治理和运行时边界。',
+            'Codex 问答笔记针对 openai/codex 代码库，把关键问题整理成可继续深挖的架构研究主题，覆盖上下文管理、压缩、缓存、工具治理和运行时边界。',
         },
         { name: 'twitter:card', content: 'summary_large_image' },
       ],
@@ -102,8 +102,8 @@ const config = {
       },
 
       prism: {
-        theme: prismThemes.oneLight,
-        darkTheme: prismThemes.oneDark,
+        theme: prismThemes.nightOwl,
+        darkTheme: prismThemes.nightOwl,
         additionalLanguages: ['rust', 'bash', 'json', 'toml'],
         magicComments: [
           {
@@ -134,7 +134,7 @@ const config = {
         '@type': 'WebSite',
         name: 'Codex 问答笔记',
         url: 'https://luochang212.github.io/codex-notebook/',
-        description: 'Codex 架构与实现问题的研究型问答笔记',
+        description: '针对 openai/codex 代码库的架构与实现问题研究型问答笔记',
       }),
     },
   ],

@@ -53,6 +53,38 @@ html[data-theme='dark'] {
   padding: 0 var(--ifm-pre-padding);
 }
 
+.theme-code-block {
+  background: #011627 !important;
+  border: 1px solid #18344f;
+  box-shadow: 0 18px 42px rgba(1, 22, 39, 0.24);
+}
+
+.theme-code-block pre,
+.theme-code-block code,
+.theme-code-block [class*='codeBlockContent'] {
+  background: #011627 !important;
+}
+
+.theme-code-block pre,
+.theme-code-block code {
+  color: #d6deeb;
+}
+
+.theme-code-block [class*='codeBlockTitle'],
+.theme-code-block [class*='copyButton'] {
+  background: #071d33 !important;
+  border-color: #18344f !important;
+  color: #d6deeb !important;
+}
+
+.theme-code-block .theme-code-block-highlighted-line {
+  background-color: rgba(130, 170, 255, 0.16);
+}
+
+.theme-code-block .code-block-key-line {
+  background-color: rgba(173, 219, 103, 0.14);
+}
+
 .qaIndexGrid {
   display: grid;
   gap: 1rem;
