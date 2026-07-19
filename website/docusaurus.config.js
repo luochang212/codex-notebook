@@ -14,6 +14,7 @@ const config = {
   onBrokenLinks: 'throw',
 
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
@@ -50,6 +51,8 @@ const config = {
       }),
     ],
   ],
+
+  themes: ['@docusaurus/theme-mermaid'],
 
   plugins: [
     [
@@ -99,6 +102,13 @@ const config = {
       footer: {
         style: 'dark',
         copyright: `Copyright © ${new Date().getFullYear()} Codex Notebook. Built with Docusaurus.`,
+      },
+
+      mermaid: {
+        theme: {
+          light: 'neutral',
+          dark: 'dark',
+        },
       },
 
       prism: {
