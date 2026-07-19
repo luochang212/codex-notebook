@@ -21,11 +21,6 @@ const sidebars = {
       items: [
         {
           type: 'doc',
-          id: 'qa-notes',
-          label: '问答索引',
-        },
-        {
-          type: 'doc',
           id: 'qa/context-collection',
           label: '01. query 上下文构造',
         },
@@ -33,6 +28,11 @@ const sidebars = {
           type: 'doc',
           id: 'qa/prompt-cache-compaction',
           label: '02. 缓存命中与压缩',
+        },
+        {
+          type: 'doc',
+          id: 'qa/codex-architecture-overview',
+          label: '03. 整体架构与复杂度',
         },
       ],
     },

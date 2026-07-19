@@ -8,12 +8,11 @@
 
 - `website/`：Docusaurus 站点源码。
 - `website/docs/intro.mdx`：首页。
-- `website/docs/qa-notes.mdx`：问答索引页。
 - `website/docs/qa/`：每个问答一个独立章节。
 - `website/src/components/ResearchQuestion.tsx`：问答章节的交互组件。
 - `website/src/components/ResearchQuestion.module.css`：问答组件样式。
 - `website/src/css/custom.css`：站点全局样式。
-- `website/sidebars.js`：侧边栏配置。
+- `website/sidebars.js`：侧边栏配置，也是问答导航的唯一手写来源；问答索引由 category `generated-index` 自动生成。
 - `website/docusaurus.config.js`：Docusaurus 配置。
 
 ## 开发命令
@@ -75,6 +74,8 @@ website/docs/qa/<topic>.mdx
 
 并在 `website/sidebars.js` 中加入对应条目。
 
+新增或删除问答章节时，只维护 `website/sidebars.js` 中的章节条目；不要再维护手写章节清单。`/qa` 索引页应由 Docusaurus `generated-index` 从侧边栏自动生成，避免同一份章节列表在多个文件里重复腐化。
+
 章节应该包含：
 
 - 原始问题：保留用户原话。
@@ -83,6 +84,8 @@ website/docs/qa/<topic>.mdx
 - 架构张力：说明为什么这个问题不是简单的是/否。
 - 关键源码切片：直接展示高信息密度源码或注明出处的伪代码。
 - 结论：回到原始问题，指出是否存在误解，以及正确的心智模型。
+
+涉及 Codex 源码判断的章节，应在正文开头用一行轻量“源码快照”说明核对对象，至少记录 `openai/codex` 的 commit；不需要额外维护调研日志或大段元数据。
 
 ## 标题规则
 
@@ -221,15 +224,6 @@ flowchart TD
 - 不要写宣传腔。
 - 不要把“复杂度”“可扩展性”“稳定性”当万能词，必须落到具体机制。
 
-## 当前重要主题
-
-当前已有章节：
-
-- `website/docs/qa/context-collection.mdx`
-- `website/docs/qa/prompt-cache-compaction.mdx`
-
-后续新增章节时，优先保持“一个问题，一个章节，一个明确源码证据链”。
-
 ## 工作流约定
 
 修改内容时：
@@ -237,9 +231,10 @@ flowchart TD
 1. 先确认用户最新反馈，避免继续沿用旧方向。
 2. 如果修改已有章节，先阅读该章节当前内容。
 3. 如果涉及 Codex 源码判断，应优先从 `.env` 的 `CODEX_SOURCE_DIR` 指向的源码仓库核对源码，不要凭记忆写；不要把本机绝对路径写进文档。
-4. 使用 `apply_patch` 修改文件。
-5. 修改后运行 `cd website && npm run build`。
-6. 最终回复说明改了哪些文件，以及构建是否通过。
+4. 新增、删除或重命名问答章节时，只同步维护 `website/sidebars.js`；不要维护手写问答索引。
+5. 使用 `apply_patch` 修改文件。
+6. 修改后运行 `cd website && npm run build`。
+7. 最终回复说明改了哪些文件，以及构建是否通过。
 
 ## 必须真实查看代码仓库
 
