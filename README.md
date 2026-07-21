@@ -1,10 +1,10 @@
 # Codex 设计原理
 
-📚 在线阅读：https://www.luochang.ink/codex-notebook/
-
 一直好奇 [Codex](https://github.com/openai/codex) 是如何工作的。这不阿里发了 Qwen 3.8，就用它蹬了一本《Codex 设计原理》。
 
 最初蹬出来的效果很差。我修了两轮：一轮修语言风格，一轮修正确性。但都不是提升洞察深度的修法，能挖多深，还是要靠模型自身的功力。所以这也是 Qwen 模型能力的有效参考！
+
+📚 在线阅读：https://www.luochang.ink/codex-notebook/
 
 ## 目录
 
