@@ -4,113 +4,94 @@ title: 模型看到的上下文是怎么拼出来的？
 sidebar_label: 4. 上下文构造
 ---
 
-## 设计问题
+想象你在编一份报纸。每天出刊前，你要决定：头版放什么、哪些新闻是新的、哪些是昨天就有的但今天更新了、哪些广告位要换。
 
-每次调模型之前，system prompt 里应该放什么？是一个固定字符串，还是动态拼接的？如果是动态的，谁决定拼什么、按什么顺序拼？
+你不会每天把整份报纸从头写一遍。你有一个**底版**——不变的报头、固定的栏目框架。然后你往上贴**增量**：今天的新闻、更新的股价、新来的广告。底版不动，增量追加。
 
-## 直觉答案 vs 实际选择
+为什么要这样？因为印刷厂有个规矩：**如果底版变了，整条流水线要重新校准。** 校准一次很贵。底版不变，只换增量，流水线就能持续跑。
 
-直觉上，system prompt 是一个写死的模板，加上一些变量替换。简单、可预测。
+Codex 的上下文构造就是这个逻辑。模型每次被调用时看到的"system prompt"不是一个固定字符串——它是一条装配流水线的产物。而这条流水线的核心约束是：**前缀不能变，变了就浪费钱。**
 
-Codex 的实际选择是：**system prompt 不存在。模型看到的"上下文"是一套装配流程的产物——每个 model step 都从多个来源动态拼接，而且不是每步都全量重建。**
+## 为什么前缀不能变
 
-## 装配流程：不是一次性的，是每步的
+OpenAI 和 Anthropic 的 API 都有 prompt cache：如果你这次请求的前缀和上次一样，服务端可以复用已缓存的 KV cache，不用重新计算。这能省 50-90% 的 token 费用。
 
-```rust
-// codex-rs/core/src/session/mod.rs:2908
-pub(crate) async fn capture_step_context(
-    self: &Arc<Self>,
-    turn_context: Arc<TurnContext>,
-) -> Arc<StepContext> {
-    let environments = turn_context.environments.refresh_readiness();
-    self.services.agents_md_manager.refresh(&turn_context.config, &environments).await;
-    let loaded_agents_md = self.services.agents_md_manager.get_loaded().await;
-    let mcp = self.mcp_runtime_for_step(...).await;
-    Arc::new(StepContext::new(
-        turn_context, environments, selected_capability_roots,
-        executor_capability_discovery, mcp, loaded_agents_md,
-    ))
-}
+但命中条件是**前缀逐字节相同**。如果你在 system prompt 中间插了一段变化的内容（比如 git status），前缀就变了，cache 全部 miss。
+
+所以规则很简单：**不变的信息放前面，变化的信息追加在后面。**
+
+```mermaid
+flowchart TD
+    A["base instructions（永不变）"] --> B["world state baseline（首次全量）"]
+    B --> C["diff 1（第 2 步的变化）"]
+    C --> D["diff 2（第 3 步的变化）"]
+    D --> E["用户消息"]
+    E --> F["模型回复"]
+    style A fill:none
+    style B fill:none
 ```
 
-每个 model step 之前，`capture_step_context` 重新收集：
+前缀（base instructions + baseline）整个 turn 不变。变化只追加在尾部。Cache 持续命中。
+
+## 每步都重新"采访"，但不是每步都"见报"
+
+每个 model step 之前，`capture_step_context` 会重新收集所有环境信息：
 
 - AGENTS.md（可能因为 cd 到新目录而变化）
 - MCP 工具列表（可能因为 server 启动/关闭而变化）
 - 环境选择（workspace roots、cwd）
 - 能力发现（executor capabilities）
 
-这意味着模型在同一个 turn 的不同 step 里，看到的工具集和上下文可能不同。
+用报纸类比：记者每步都出去采访（重建 WorldState），但只有采访到了**新东西**，才会见报（注入上下文）。如果环境完全没变，这步什么都不追加。
 
-## 首次全量 vs 后续增量
+## 首次全量，后续增量
 
-```rust
-// codex-rs/core/src/session/mod.rs:3576
-let (context_items, world_state_item) = if should_inject_full_context {
-    // 首次：全量注入（base instructions + world state + MCP tools）
-    let context_items = self.build_initial_context_with_world_state_and_mcp(...).await;
-    state.history.set_world_state_baseline(snapshot);
-    (context_items, Some(WorldStateItem::full(snapshot)))
-} else {
-    // 后续：只注入变化部分
-    let context_items = self.build_settings_update_items(...).await;
-    let (fragments, _) = state.history.update_world_state(world_state);
-    context_items.extend(fragments);
-    (context_items, world_state_item)
-};
+第一步（turn 的第一个 model step）是特殊的：它注入所有东西——base instructions、完整的 world state、MCP 工具列表、可用 skills。这是"底版"。
+
+后续步骤只做 diff：和 baseline 比较，只注入变化的部分。
+
+```mermaid
+flowchart TD
+    A{"是第一步？"} -->|是| B["全量注入：base + world state + MCP + skills"]
+    B --> C["设为 baseline"]
+    A -->|否| D["和 baseline 做 diff"]
+    D --> E{"有变化？"}
+    E -->|是| F["只追加变化部分"]
+    E -->|否| G["什么都不注入"]
 ```
 
-关键设计：
-
-- **首次**（`reference_context_item.is_none()`）：全量注入所有上下文，设为 baseline
-- **后续**：只注入和 baseline 的 diff（配置变化、world state 变化、turn context 变化）
-
-这不是为了省 token——是为了**保护 prompt cache 前缀**。如果每步都全量重建，前缀变了，cache 就 miss。只追加 diff，前缀不变，cache 命中。
+这不是为了省 token（虽然确实省了）。核心目的是**保护前缀不变**。如果每步都全量重建，前缀就变了，cache 就 miss。只追加 diff，前缀不动，cache 命中。
 
 ## 上下文的来源清单
 
-从 `context/` 目录的文件名可以看出所有注入来源：
+从源码的 `context/` 目录可以看到所有注入来源：
 
-| 来源 | 文件 | 注入时机 |
-|------|------|----------|
-| 基础指令 | `user_instructions.rs` | 首次全量 |
-| AGENTS.md | `world_state/agents_md.rs` | 每步检查变化 |
-| 权限说明 | `permissions_instructions.rs` | 配置变化时 |
-| 环境信息 | `environment_context.rs` | 每步（git status 等） |
-| 可用 skills | `available_skills_instructions.rs` | 首次或变化时 |
-| 可用插件 | `available_plugins_instructions.rs` | 首次或变化时 |
-| MCP 工具 | 通过 StepContext.mcp | 每步重建 |
-| 子 agent 列表 | `world_state/environment.rs` | 每步（baseline/diff） |
-| 时间提醒 | `current_time_reminder.rs` | 周期性 |
-| 多 agent 指令 | `multi_agent_mode_instructions.rs` | 首次 |
+| 来源 | 注入时机 | 变化频率 |
+|------|----------|----------|
+| 基础指令 | 首次全量 | 整个 session 不变 |
+| AGENTS.md | 每步检查 | 偶尔（cd 或文件修改） |
+| 权限说明 | 配置变化时 | 很少 |
+| 环境信息（git status 等） | 每步 | 经常 |
+| 可用 skills | 首次或变化时 | 偶尔 |
+| MCP 工具 | 每步重建 | 偶尔 |
+| 子 agent 列表 | 每步（baseline/diff） | 经常（多 agent 模式） |
+| 时间提醒 | 周期性 | 固定间隔 |
 
-## 为什么不是"一个 system prompt"
+注意变化频率的差异：base instructions 整个 session 不变，git status 每步都变。如果把它们放在同一个"system prompt 模板"里，要么每步都变（cache miss），要么 git status 不更新（模型不知道环境变了）。baseline/diff 机制让不同频率的信息各得其所。
 
-传统做法是把所有信息塞进一个 system prompt 字符串。Codex 不这样做，因为：
+## 代价
 
-1. **prompt cache 要求前缀稳定**——如果 system prompt 每步都变（比如包含 git status），cache 永远 miss
-2. **增量注入让变化可追踪**——rollout 里记录的是"第 N 步注入了什么 diff"，而不是"第 N 步的完整 prompt 是什么"
-3. **不同来源有不同的更新频率**——base instructions 整个 session 不变，git status 每步都变，AGENTS.md 偶尔变
+这套机制的代价很具体：
 
-## 取舍
+**你无法打开一个文件看到"模型看到的完整 system prompt"。** 它不存在于任何一个地方。它是 baseline + 所有 diff 的叠加结果。调试"为什么模型不知道 X？"需要追踪 X 的注入条件和 diff 逻辑。
 
-**得到什么**：
+**实现复杂度。** baseline/diff 比"每次全量拼"复杂得多。需要维护 baseline、做 diff、处理 baseline 重置（compaction 后，见 ch05）。
 
-- prompt cache 命中率最大化——前缀稳定，只有尾部追加
-- 上下文变化可审计——rollout 里有完整的注入记录
-- 灵活——新来源只需要实现一个 fragment builder，不需要改"主模板"
+**但换来的是：** 一个 20 步的 turn，前 19 步的 cache 都命中。如果用全量重建，20 步全部 miss。对于长 turn（coding agent 的典型场景），这个差距是几十倍的 token 费用。
 
-**放弃什么**：
+## 一句话总结
 
-- 最终 prompt 难以预测——你无法打开一个文件看到"模型看到的完整 system prompt"
-- 调试困难——"为什么模型不知道 X？"需要追踪 X 的注入条件和 diff 逻辑
-- 实现复杂——baseline/diff 机制比"每次全量拼"复杂得多
-
-## 对读者的启示
-
-如果你的 agent 系统不需要 prompt cache（比如用本地模型），全量重建 system prompt 是最简单的方案。但如果你用 OpenAI/Anthropic 的 API 并且关心成本，prompt cache 就是必须考虑的约束。
-
-Codex 的核心洞察是：**prompt cache 的命中条件是"前缀不变"，所以变化的信息必须追加在尾部，不能插入前缀。** 这个约束反过来决定了整个上下文装配的架构——不是"拼一个字符串"，而是"维护一个 baseline + 追加 diff 序列"。
+上下文不是一个字符串，是一条装配线。约束是"前缀不能变"，策略是"首次全量、后续追加 diff"，代价是调试困难，收益是 cache 命中率。
 
 ---
 

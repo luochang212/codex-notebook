@@ -21,7 +21,7 @@ const sidebars = {
       type: 'category',
       label: '第二篇：上下文工程',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch04-context-assembly',
         'qa/ch05-cache-compaction',
@@ -32,7 +32,7 @@ const sidebars = {
       type: 'category',
       label: '第三篇：工具与执行',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch07-tool-system',
         'qa/ch08-exec-sandbox',
@@ -42,7 +42,7 @@ const sidebars = {
       type: 'category',
       label: '第四篇：安全与审批',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch09-guardian',
       ],
@@ -51,7 +51,7 @@ const sidebars = {
       type: 'category',
       label: '第五篇：多 Agent',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch10-agent-roles',
         'qa/ch11-agent-communication',
@@ -61,7 +61,7 @@ const sidebars = {
       type: 'category',
       label: '第六篇：扩展与配置',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch12-skills',
         'qa/ch13-mcp-plugins',
@@ -72,7 +72,7 @@ const sidebars = {
       type: 'category',
       label: '第七篇：设计哲学',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       items: [
         'qa/ch15-philosophy',
       ],

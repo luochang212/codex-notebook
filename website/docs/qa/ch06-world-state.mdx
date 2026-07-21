@@ -4,101 +4,72 @@ title: 环境信息每步都变，怎么高效告诉模型？
 sidebar_label: 6. WorldState 与增量记录
 ---
 
-## 设计问题
+ch04 讲了上下文装配的总流程。这一章只聚焦其中一个子问题：环境信息（git status、子 agent 列表、AGENTS.md、权限配置）每步都可能变，怎么告诉模型？
 
-每个 model step 之前，环境信息（git status、子 agent 列表、权限配置、AGENTS.md）都可能变化。如果每步都全量注入这些信息，token 浪费严重且破坏 prompt cache。如果完全不注入，模型就不知道环境变了。怎么平衡？
+我用问答的方式推进。
 
-## 直觉答案 vs 实际选择
+## 每步都全量注入不行吗？
 
-直觉上，每步把最新的环境信息拼进 system prompt。简单，但每步都变的前缀让 prompt cache 永远 miss。
+可以，但贵。
 
-Codex 的实际选择是：**WorldState 每步重建，但记录到模型上下文时采用 baseline/diff 机制——首次全量写入，后续只追加变化部分。**
+假设一个 turn 有 10 个 step（模型调了 10 次工具）。环境信息大约 2000 token。每步全量注入 = 10 × 2000 = 20000 token 花在重复的环境信息上。
 
-## WorldState 的组成
+更致命的是：每步追加一段全量 WorldState，前缀就变了，prompt cache 就 miss。10 步全 miss。
 
-```rust
-// codex-rs/core/src/session/world_state.rs:19
-pub(crate) async fn build_world_state_for_step(&self, step_context: &StepContext) -> WorldState {
-    let mut world_state = WorldState::default();
-    world_state.add_section(RealtimeState::new(...));
-    world_state.add_section(AgentsMdState::new(...));
-    world_state.add_section(PermissionsState::new(...));
-    world_state.add_section(EnvironmentsState::from_turn_context_with_environments(...)
-        .with_subagents(environment_subagents));
-    world_state.add_section(AppsInstructionsState::new(...));
-    world_state.add_section(PluginsInstructionsState::new(...));
-    // extension 贡献的额外 section
-    for contributor in self.services.extensions.context_contributors() {
-        for section in contributor.contribute_world_state(...).await {
-            world_state.add_extension_section(section);
-        }
-    }
-    world_state
-}
+## 那完全不注入呢？
+
+也不行。模型不知道环境变了。
+
+比如模型在 step 3 执行了 `git checkout -b feature`，到 step 7 它需要知道当前分支已经变了。如果不告诉它，它可能基于错误的分支信息做决策。
+
+## 所以答案是？
+
+**每步都重建，但只注入变化。**
+
+"重建"和"注入"是两件事。重建是为了保证正确性（不遗漏变化），注入是为了效率（只告诉模型新东西）。
+
+```mermaid
+flowchart TD
+    A["每步：从头构建 WorldState"] --> B{"和上一步的 baseline 比，有变化？"}
+    B -->|"没变"| C["什么都不注入"]
+    B -->|"变了"| D["只注入变化的 section"]
+    D --> E["更新 baseline"]
 ```
 
-WorldState 是一个 section 集合，每个 section 对应一类环境信息。每步都从头构建——但构建不等于注入。
+如果某步环境完全没变（模型只是输出了一段文本），fragments 为空，不注入任何内容。零开销。
 
-## baseline/diff：只记录变化
+## 具体怎么 diff？
 
-```rust
-// codex-rs/core/src/context_manager/history.rs:91
-pub(crate) fn update_world_state(
-    &mut self,
-    world_state: &WorldState,
-) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
-    let snapshot = world_state.snapshot();
-    // 和 baseline 做 diff，只渲染变化部分
-    let fragments = world_state.render_history_diff(
-        self.world_state_baseline.as_ref(), &self.items);
-    // rollout 记录：首次全量，后续 patch
-    let rollout_item = self.world_state_baseline.as_ref().map_or_else(
-        || Some(WorldStateItem::full(snapshot.clone().into_value())),
-        |previous| snapshot.merge_patch_from(previous).map(WorldStateItem::patch),
-    );
-    self.world_state_baseline = Some(snapshot);
-    (fragments, rollout_item)
-}
-```
+WorldState 是一个 section 集合。每个 section 对应一类环境信息：
 
-两层记录：
+- `RealtimeState`：实时状态
+- `AgentsMdState`：AGENTS.md 内容
+- `PermissionsState`：权限配置
+- `EnvironmentsState`：工作目录、子 agent 列表
+- `PluginsInstructionsState`：插件指令
 
-1. **模型可见层**（`fragments`）：`render_history_diff` 只生成和 baseline 不同的 section 文本，追加到对话历史尾部
-2. **持久化层**（`rollout_item`）：首次记录 `WorldStateItem::full`，后续记录 `WorldStateItem::patch`（JSON merge patch）
+每步构建完新的 WorldState 后，和上一步的 snapshot 逐 section 比较。只有内容变了的 section 才会被渲染成文本追加到对话历史。
 
-如果某步环境完全没变（比如模型只是输出了一段文本），`fragments` 为空，不注入任何内容。
+持久化层也做 diff：首次记录 `WorldStateItem::full`（全量快照），后续记录 `WorldStateItem::patch`（JSON merge patch）。rollout 文件不会膨胀。
 
-## 为什么不是每步全量
+## baseline 什么时候重置？
 
-假设一个 turn 有 10 个 step（模型调了 10 次工具）。如果每步全量注入 WorldState：
+两种情况：
 
-- 10 × ~2000 token = 20000 token 浪费在重复的环境信息上
-- 每步前缀都变（因为追加了新的全量 WorldState），prompt cache 永远 miss
+1. **Compaction**（ch05）：压缩后旧历史被摘要替代，baseline 必须重置为压缩时刻的完整 WorldState。否则后续 diff 基于一个已经不存在的基准。
+2. **Turn 结束**：新 turn 的第一步重新全量注入，设新 baseline。
 
-用 baseline/diff：
+这里有一个真实的风险：如果 compaction 时 baseline 处理不当（比如丢了某个 section），后续 diff 就会基于错误的基准，模型可能看到不完整的环境信息。这是 baseline/diff 机制最脆弱的地方。
 
-- 首次 ~2000 token，后续 9 步可能只有 ~50 token（比如只有 git status 变了）
-- 前缀不变，prompt cache 持续命中
+## 为什么不直接用 git diff 的思路？
 
-## 取舍
+其实很像。但有一个区别：git diff 是文本级的（行级 diff），WorldState 的 diff 是 **section 级**的。一个 section 要么整体变了（重新注入整个 section），要么没变（不注入）。不做 section 内部的行级 diff。
 
-**得到什么**：
+为什么？因为 section 通常很短（几十到几百 token），行级 diff 的收益很小，但实现复杂度大增。而且模型不需要知道"git status 的第 3 行变了"，它只需要看到最新的 git status。
 
-- token 效率——不变的信息不重复注入
-- prompt cache 友好——前缀稳定
-- 持久化紧凑——rollout 里只存 patch，不存每步的全量快照
+## 一句话
 
-**放弃什么**：
-
-- 实现复杂度——需要维护 baseline、做 diff、处理 baseline 重置（compaction 后）
-- 调试困难——"模型看到的完整环境信息"需要从 baseline + 所有 patch 重建
-- baseline 丢失风险——如果 compaction 时 baseline 处理不当，后续 diff 可能基于错误的基准
-
-## 对读者的启示
-
-如果你的 agent 每个 turn 只有 1-2 个 step，baseline/diff 的收益很小，全量注入更简单。但如果你的 agent 一个 turn 可能跑 20+ 个 tool call（coding agent 的典型场景），环境信息的重复注入会成为 token 消耗的大头。
-
-核心洞察：**"每步重建"和"每步注入"是两件事。** 重建是为了保证正确性（不遗漏变化），注入是为了效率（只告诉模型新东西）。把这两件事分开，才能同时满足正确性和效率。
+"每步重建"保证正确性，"只注入 diff"保证效率。把这两件事分开，才能同时满足"模型永远知道最新环境"和"不浪费 token、不破坏 cache"。
 
 ---
 

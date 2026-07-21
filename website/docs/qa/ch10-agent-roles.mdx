@@ -1,110 +1,77 @@
 ---
 id: ch10-agent-roles
-title: 为什么需要多种"角色"而不是统一的一种 agent？
+title: 子 agent 的角色为什么没有权限边界？
 sidebar_label: 10. 角色与 Spawn
 ---
 
-## 设计问题
+假设你让 Codex 重构一个大型 monorepo。任务太复杂，一个 agent 忙不过来，于是它决定 spawn 几个子 agent 并行工作：一个去搞清楚认证模块的依赖关系，一个去改数据库层的接口，一个去跑测试。问题来了——这三个子 agent 应该是"同一种东西的三个实例"，还是"三种不同的东西"？
 
-一个 coding agent 遇到复杂任务时，需要把子任务分给多个子 agent。问题是：这些子 agent 应该是"同一种东西的不同实例"，还是"不同种类的东西"？如果是不同种类，"种类"由什么定义？
+如果你设计过微服务，直觉会告诉你：它们应该是不同的。explorer 只负责读代码、回答问题，不应该有写权限；worker 负责改代码，但不应该做架构决策。每个角色有独立的权限边界，就像每个服务有独立的 API 一样。
 
-## 直觉答案 vs 实际选择
+Codex 没有这样做。它的选择让我第一次看源码时有点意外。
 
-直觉上，不同角色应该有不同能力——explorer 只能读代码不能写，worker 能写代码但不能做架构决策。像微服务一样，每个角色有独立的权限边界。
+## 角色不是给子 agent 看的，是给父 agent 看的
 
-Codex 的实际选择出人意料地轻量：**角色只是一段写给父 agent 看的 description 文本，加上可选的配置覆盖。** 它不是子 agent 的行为约束，而是父 agent 的"使用说明书"。
+我们先搞清楚一件事：当 Codex 说"角色"时，这个信息到底去了哪里？
 
-## 角色的本质：spawn tool 的 description
+答案是一条单向链路：角色定义（name + description）→ 拼接成文本 → 塞进 spawn 工具的 description → **父 agent 看到工具描述** → 父 agent 决定用哪个角色 spawn → 子 agent 被创建 → 子 agent 不知道自己是什么角色。
 
-```rust
-// codex-rs/core/src/agent/role.rs:230-258
-pub(crate) mod spawn_tool_spec {
-    pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
-        let built_in_roles = built_in::configs();
-        build_from_configs(built_in_roles, user_defined_agent_roles)
-    }
+注意终点：角色的 description 最终出现在**父 agent 的工具描述**里，而不是子 agent 的 system prompt 里。父 agent 看到"Available roles: explorer - 用于代码库问题…"这段文字后，自己决定"我应该 spawn 一个 explorer"。
 
-    fn build_from_configs(
-        built_in_roles: &BTreeMap<String, AgentRoleConfig>,
-        user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
-    ) -> String {
-        let mut seen = BTreeSet::new();
-        let mut formatted_roles = Vec::new();
-        for (name, declaration) in user_defined_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-        for (name, declaration) in built_in_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-        format!("Available roles:\n{}", formatted_roles.join("\n"))
-    }
-}
-```
+子 agent 呢？它完全不知道自己被标记成了什么“角色”。没有额外的 system prompt，没有行为约束，没有权限收窄。它的行为完全由 config 决定。
 
-这段代码的读者不是子 agent，而是**父 agent**。`spawn_tool_spec::build` 把所有角色的 name + description 拼成一段文本，塞进父 agent 的 spawn tool 的 description 里。父 agent 看到这段文本后，决定"我应该用哪个角色来 spawn 子 agent"。
+换句话说，Codex 的“角色”不是子 agent 的身份，而是父 agent 的使用说明书。这就像餐厅菜单上写的“推荐搭配”——它告诉点菜的人怎么选，但厨房不会因为菜单上写了“清淡”就少放盐。
 
-子 agent 本身完全不知道自己的"角色"是什么。它的行为由 config（模型、工具、权限）决定，不由 description 决定。
+## 那么 explorer.toml 里到底写了什么？
 
-## 内建角色：三个配置预设
+知道了角色只是 description 文本后，我们来看看内建角色。Codex 有三个：
 
-| 角色 | description 要点 | config_file | 实际效果 |
-|------|-----------------|-------------|----------|
-| `default` | "Default agent." | 无 | 继承父 agent 配置 |
-| `explorer` | 用于代码库问题，快速、权威，鼓励并行 spawn | `explorer.toml`（空文件） | 和 default 完全相同 |
-| `worker` | 用于执行和生产工作，强调文件所有权、不要 revert 别人的修改 | 无 | 和 default 完全相同 |
+| 角色 | description 要点 | config_file |
+|------|-----------------|-------------|
+| `default` | "Default agent." | 无 |
+| `explorer` | 用于代码库问题，快速、权威，鼓励并行 spawn | `explorer.toml` |
+| `worker` | 用于执行工作，强调文件所有权、不要 revert 别人的修改 | 无 |
+
+explorer 有一个 `config_file`。我们可能会期待里面写了一些特殊配置——比如禁用写工具、换一个更快的模型、降低 reasoning effort。
+
+打开一看：
 
 ```rust
-// codex-rs/core/src/agent/role.rs:315-377（built_in 模块，节选）
-(
-    "explorer".to_string(),
-    AgentRoleConfig {
-        description: Some(r#"Use `explorer` for specific codebase questions.
-Explorers are fast and authoritative.
-They must be used to ask specific, well-scoped questions on the codebase.
-Rules:
-- In order to avoid redundant work, you should avoid exploring the same
-  problem that explorers have already covered...
-- You are encouraged to spawn up multiple explorers in parallel..."#.to_string()),
-        config_file: Some("explorer.toml".parse().unwrap_or_default()),
-        nickname_candidates: None,
-    }
-),
+// codex-rs/core/src/agent/builtins/explorer.toml
+// （文件内容：空）
 ```
 
-注意 `explorer.toml` 是一个**空文件**。这意味着 explorer 和 default 在配置层面完全相同——相同的模型、相同的工具、相同的权限。唯一的区别是父 agent 看到的 description 不同，导致它以不同方式使用 spawn 工具。
+空的。一个字节都没有。
 
-## Spawn 的实际过程
+这意味着 explorer 和 default 在运行时**完全相同**——相同的模型、相同的工具、相同的权限、相同的沙箱。唯一的区别是父 agent 看到的 description 不同。description 里写了"Explorers are fast and authoritative"，但系统层面没有任何机制保证这一点。
 
-当父 agent 调用 spawn 工具时，系统做三件事：
+说实话，第一次看到这个空文件时我觉得这是个 bug，或者是个还没实现的 TODO。但后来我想明白了：这恰恰是最诚实的设计。Codex 承认自己无法在系统层面强制"explorer 只读不写"这种行为边界，所以它干脆不假装。它把选择权完全交给模型——如果模型认为某个任务适合用 explorer，它就 spawn 一个 explorer；如果模型判断错了，那也不是系统的责任。
 
-1. **应用角色配置**：`apply_role_to_config` 把角色的 config_file（如果有非空内容）作为高优先级层插入 config
-2. **创建新 Session**：子 agent 获得独立的 Session（独立的 conversation history、独立的 turn 循环）
-3. **注入初始输入**：父 agent 给的任务描述作为子 agent 的第一条 user message
+## 但 spawn 过程确实做了一些事
 
-```rust
-// codex-rs/core/src/agent/role.rs:38-54
-pub(crate) async fn apply_role_to_config(
-    config: &mut Config,
-    role_name: Option<&str>,
-) -> Result<(), String> {
-    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
-    let role = resolve_role_config(config, role_name)
-        .cloned()
-        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
-    apply_role_to_config_inner(config, role_name, &role).await.map_err(|err| {
-        tracing::warn!("failed to apply role to config: {err}");
-        AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
-    })
-}
+虽然角色本身只是文本，spawn 过程并不是简单的“复制一个 Session”。当父 agent 调用 spawn 工具时，系统做三件事：
+
+```mermaid
+flowchart TD
+    A["父 agent 调用 spawn 工具"] --> B["应用角色配置"]
+    B --> C{"config_file 非空？"}
+    C -->|是| D["作为高优先级配置层插入"]
+    C -->|否| E["沿用父 agent 配置"]
+    D --> F["创建新 Session"]
+    E --> F
+    F --> G["注入任务描述作为第一条 user message"]
+    G --> H["子 agent 开始独立运行"]
 ```
 
-关键细节：`apply_role_to_config` 保留父 agent 的 model、model_provider、service_tier，除非角色的 config_file 显式覆盖。这防止了子 agent 因为角色切换而意外降级到默认模型。
+这里有一个容易忽略的细节：配置继承是“保守”的。如果角色的 config_file 没有显式指定模型，子 agent 会沿用父 agent 的 model、model_provider、service_tier。为什么？因为如果用户正在用一个高级模型，spawn 出来的子 agent 不应该悄悄降级到默认模型。没有明确说的，就沿用父 agent 的。
 
-## 深度限制：防止无限递归
+如果你想看这一步的具体实现，核心是 `apply_role_to_config`（`codex-rs/core/src/agent/role.rs:38`）：它解析角色名、加载 config_file、调用 `build_next_config` 做层合并。保留逻辑在 `reload_overrides` 里——只有角色层显式设置了 `model` 字段，才会覆盖父 agent 的模型选择。
+
+## 那谁来防止无限 spawn？
+
+角色系统这么轻量，会不会出问题？最容易想到的是：一个 agent spawn 子 agent，子 agent 又 spawn 孙 agent，无穷无尽。
+
+Codex 用一个极其简单的深度计数来解决：
 
 ```rust
 // codex-rs/core/src/agent/registry.rs:70-76
@@ -117,29 +84,22 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 ```
 
-每个子 agent 的 SessionSource 记录了它的 spawn 深度。spawn 时检查深度是否超限。这是一个简单的递归保护——没有它，一个 agent 可以无限 spawn 子 agent，耗尽系统资源。
+每个子 agent 的 SessionSource 记录了它被 spawn 时的深度。超过上限就拒绝。没有复杂的资源核算、没有令牌桶、没有优先级队列——就是一个整数比较。对于当前的使用场景（深度通常不超过 3-4 层），这完全够用。
 
-## 取舍
+## 这个设计到底在赌什么？
 
-**得到什么**：
+回顾整个角色系统，Codex 做了一个非常激进的赌注：**模型能根据 description 正确使用 spawn 工具。**
 
-- 极其轻量的角色系统——添加新角色只需一段 description + 可选的 toml 配置
-- 不引入新的运行时机制——角色不是新类型的 agent，只是配置预设
-- 父 agent 自主决策——系统不强制"什么时候该用什么角色"，由模型判断
+它赌的是：
+- 父 agent 看到"explorer 用于代码库问题"后，真的只在需要问代码库问题时 spawn explorer
+- 父 agent 看到"鼓励并行 spawn"后，真的会在有多个独立问题时并行 spawn
+- 子 agent 虽然不知道自己是什么"角色"，但因为收到的任务描述足够明确，行为自然符合预期
 
-**放弃什么**：
+这个赌注的代价是：系统层面没有任何强制隔离。如果模型决定用 explorer 去删文件，没有任何机制阻止它（当然，沙箱会限制它能删什么）。
 
-- 无法强制执行行为边界——description 说"explorer 只读不写"，但 explorer 实际上有写权限
-- 角色之间没有真正的能力差异——如果 config_file 为空，所有角色在运行时完全相同
-- 依赖模型遵守 description 中的"规则"——这些规则只是 prompt 文本，不是硬约束
+但收益也很明显：添加一个新角色只需要写一段 description。不需要新的 handler、新的权限模型、新的运行时分支。整个角色系统的代码量可能还不到 400 行。
 
-## 对读者的启示
-
-如果你的 agent 系统需要"不同类型的子 agent"，先问一个问题：这些"类型"之间的差异是**配置差异**（不同模型、不同工具集、不同权限）还是**行为差异**（不同的决策逻辑、不同的输出格式）？
-
-如果是配置差异，Codex 的角色系统（description + config overlay）就够了。如果是行为差异，你需要更重的机制——不同的 system prompt、不同的工具 handler、甚至不同的模型。
-
-核心洞察：**Codex 把"角色"定义为"给调度者看的使用说明"，而不是"给执行者看的行为约束"。** 这是一个极端轻量的设计——它假设模型能根据 description 正确使用 spawn 工具，而不需要系统层面的强制隔离。
+如果你要做类似的设计，关键判断是：你的"角色"之间的差异是**配置差异**还是**行为差异**？如果是配置差异（不同模型、不同工具集），Codex 这套 description + config overlay 就够了。如果是行为差异（不同的决策逻辑、不同的输出约束），你需要更重的机制——不同的 system prompt、不同的工具白名单、甚至不同的模型。Codex 选择了最轻的那条路，因为它信任模型能根据任务描述自行调整行为。这个信任是否合理，取决于你用的模型有多强。
 
 ---
 

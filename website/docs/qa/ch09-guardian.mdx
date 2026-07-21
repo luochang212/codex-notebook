@@ -4,71 +4,79 @@ title: 沙箱管不了的事，谁来管？
 sidebar_label: 9. Guardian 审批机制
 ---
 
-## 设计问题
+你开了 full-auto 模式，让 Codex 自己干活。它跑得很快——一个 turn 里可能执行 20 条命令。然后你发现一个问题：其中有些命令你其实想看一眼再决定要不要跑。
 
-沙箱限制了进程能碰什么资源，但有些决策不是"能不能做"而是"该不该做"。比如模型要 apply 一个 patch——沙箱允许写文件，但这个 patch 的内容合理吗？这个判断谁来做？
+比如 `git push --force`。沙箱不会拦它（它不破坏文件系统），exec policy 也不会拦它（它不在黑名单里）。但你真的希望 agent 未经确认就 force push 吗？
 
-## 直觉答案 vs 实际选择
+反过来，如果你把 approval_policy 设成"每条命令都问我"，那 20 条命令就要点 20 次"确认"。你本来开 full-auto 就是为了不点这些按钮。
 
-直觉上，所有危险操作都弹框让用户确认。安全，但用户会被审批弹窗淹没。
+这就是**审批疲劳**的困境：全放行不安全，全审批太烦。需要一个中间地带。
 
-Codex 的实际选择是：**用一个专门的 guardian 模型做自动审批。** guardian 是一个独立的 review session，它看到操作的上下文（用户意图 + 最近的操作历史），判断"这个操作是否符合用户意图"。只有 guardian 不确定或拒绝时，才升级给用户。
+## Guardian：一个专门做判断的模型
 
-## Guardian 的工作流程
+Codex 的解法是引入一个独立的 guardian 模型。它不做代码修改，不执行命令——它只做一件事：看到待审批的操作 + 用户意图 + 最近的操作历史，然后回答"这个操作符合用户意图吗？"
 
-```rust
-// codex-rs/core/src/guardian/mod.rs:1-12
-//! 1. Reconstruct a compact transcript that preserves user intent plus the most
-//!    relevant recent assistant and tool context.
-//! 2. Ask a dedicated guardian review session to assess the exact planned
-//!    action and return strict JSON.
-//! 3. Fail closed on timeout, execution failure, or malformed output.
-//! 4. Apply the guardian's explicit allow/deny outcome.
+```mermaid
+flowchart TD
+    A["模型要执行一个操作"] --> B{"exec policy 判定"}
+    B -->|"白名单放行"| C["直接执行"]
+    B -->|"黑名单拒绝"| D["直接拒绝"]
+    B -->|"需要审批"| E["Guardian 介入"]
+    E --> F["重建上下文：用户意图 + 最近 40 条消息"]
+    F --> G["调用 guardian 模型"]
+    G --> H{"guardian 判定"}
+    H -->|allow| C
+    H -->|deny| I["拒绝或升级给用户"]
+    H -->|"超时/报错/格式错误"| I
 ```
 
-四步：
+注意最后一条：**超时、报错、输出格式错误，一律 deny。** 这叫 fail closed——guardian 出问题时不会静默放行。宁可多问一次用户，不可漏过一次危险操作。
 
-1. **重建上下文**：从对话历史中提取用户意图 + 最近 40 条相关消息/工具调用（截断到 ~10000 token）
-2. **调用 guardian 模型**：把上下文 + 待审批操作发给 guardian，要求返回结构化 JSON（allow/deny + 理由）
-3. **失败即拒绝**：超时（90s）、模型报错、输出格式错误 → 一律 deny（fail closed）
-4. **执行决策**：allow → 自动放行；deny → 拒绝或升级给用户
+## Guardian 看到什么？
 
-## 熔断器：防止 guardian 陷入死循环
+它不看全部对话历史（太长了）。它看的是一个压缩版：
+
+1. 用户意图（原始请求）
+2. 最近 40 条相关消息/工具调用（截断到 ~10000 token）
+3. 待审批的具体操作
+
+然后它返回结构化 JSON：allow 或 deny + 理由。不是自由文本——必须是严格的结构化输出，解析失败就当 deny 处理。
+
+## 熔断器：防止死循环
+
+有一个边界情况：模型反复尝试同一个操作，guardian 反复拒绝。如果不管，就会无限循环——模型试、guardian 拒、模型换个姿势再试、guardian 再拒……消耗 token 但永远不前进。
+
+Codex 设了一个熔断器：**同一个 turn 内，guardian 连续拒绝 3 次，就不再自动审批了，直接升级给用户。**
 
 ```rust
-// codex-rs/core/src/guardian/mod.rs:47
 pub(crate) const MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN: u32 = 3;
 ```
 
-如果 guardian 连续拒绝 3 次同一个 turn 的操作，熔断器触发——不再自动审批，直接升级给用户。这防止了"模型反复尝试同一个操作，guardian 反复拒绝"的死循环。
+3 次是一个经验值。太小（1 次）会让 guardian 形同虚设；太大（10 次）会浪费太多 token 在审批上。
 
-## Guardian 不是万能的
+## Guardian 不管什么？
 
-Guardian 只处理 `on-request` 审批——即 exec policy 标记为"需要审批"的操作。它不处理：
+它只处理 exec policy 标记为"需要审批"的操作。以下情况不经过 guardian：
 
-- 已经被 exec policy 白名单放行的命令
+- 已经被 exec policy 白名单放行的命令（`cargo build`、`git status`）
 - 已经被沙箱阻止的操作（根本到不了 guardian）
-- 文件写入（apply_patch 默认不需要审批，除非配置了更严格的策略）
+- 文件写入（apply_patch 默认不需要审批）
 
-## 取舍
+Guardian 处理的是灰色地带：**技术上允许，但需要判断是否合理。** "能不能做"由沙箱和 exec policy 硬拦截；"该不该做"由 guardian 软判断。
 
-**得到什么**：
+## 代价
 
-- 用户不被审批弹窗淹没——大部分"安全但需要确认"的操作由 guardian 自动处理
-- fail closed 保证安全——guardian 出问题时不会静默放行
-- 熔断器防止死循环——不会无限消耗 token 在审批上
+- 每次审批都是一次模型调用——有延迟（超时上限 90 秒）和 token 成本
+- Guardian 也是 LLM，会误判——可能错误地 allow 一个危险操作，或错误地 deny 一个安全操作
+- 慢网络下 90 秒超时意味着用户可能等很久
 
-**放弃什么**：
+但对比替代方案（每条命令都弹框让用户确认），guardian 把 20 次人工审批减少到 0-2 次。对于高频操作的 coding agent，这个差距决定了 full-auto 模式是否可用。
 
-- guardian 本身消耗 token——每次审批都是一次模型调用
-- guardian 可能误判——它也是一个 LLM，可能错误地 allow 或 deny
-- 90s 超时意味着慢网络下用户要等很久
+## 回到审批疲劳
 
-## 对读者的启示
+现在你能理解 guardian 的位置了：它不是安全机制（那是沙箱和 exec policy 的事），它是**体验机制**。它让"安全"和"不打扰用户"可以同时成立。
 
-如果你的 agent 系统面向开发者（他们能看懂命令、能判断风险），可以不用 guardian，直接弹框让用户确认。但如果面向非技术用户，或者操作频率很高（一个 turn 可能执行 20 条命令），自动审批就是必须的。
-
-核心洞察：**审批的本质是"这个操作是否符合用户意图"，而不是"这个操作是否危险"。** 危险操作由沙箱和 exec policy 硬拦截。guardian 处理的是"技术上允许，但需要判断是否合理"的灰色地带。
+没有 guardian，full-auto 要么不安全（全放行），要么不可用（全审批）。有了 guardian，大部分"安全但需要确认"的操作被自动处理，只有真正可疑的才升级给用户。
 
 ---
 

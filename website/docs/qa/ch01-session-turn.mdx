@@ -4,128 +4,103 @@ title: 谁拥有一次对话的生命周期？
 sidebar_label: 1. Session 与 Turn
 ---
 
-## 设计问题
+你正在让 Codex 重构一个模块。它已经读了 8 个文件、改了 3 个、跑了 2 次测试。第 4 次测试跑到一半，你发现方向不对，按了 Ctrl+C。
 
-一个 coding agent 的"一次对话"应该由谁管理？是调用方（CLI、IDE 插件）管，还是 agent 内核管？
+现在问题来了：中断之后，发生了什么？
 
-## 直觉答案 vs 实际选择
+如果这是一个无状态的 API 调用——你发一条消息，等一条回复——那 Ctrl+C 意味着这次请求作废，之前的 8 次文件读取、3 次修改、2 次测试结果全部蒸发。你得从头来。
 
-直觉上，调用方发送一条消息、等待一条回复，对话就结束了。生命周期由调用方控制，agent 只是一个无状态的请求-响应服务。
+但 Codex 不是这样。你按了 Ctrl+C，当前操作停了，但对话还在。模型记得它改过哪些文件、为什么改、测试跑到哪了。你可以直接说"换个方向，别动 auth 模块"，它接着干。
 
-Codex 的实际选择是：**Session 是一个长生命周期的有状态对象，拥有自己的事件循环；Turn 是 Session 内部的一个有界执行单元。** 调用方不控制 turn 的开始和结束——它只是往 Session 的 submission channel 里投递一个 `Op::UserInput`，然后从 event channel 里读取事件流。
+这个"中断不丢状态"的能力，不是一个小功能。它背后是一个根本性的架构决策：**谁拥有对话的生命周期？**
 
-```rust
-// codex-rs/core/src/session/session.rs:28
-pub(crate) struct Session {
-    pub(crate) thread_id: ThreadId,
-    pub(super) tx_event: Sender<Event>,
-    pub(super) agent_status: watch::Sender<AgentStatus>,
-    pub(super) state: Mutex<SessionState>,
-    pub(crate) conversation: Arc<RealtimeConversationManager>,
-    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
-    pub(crate) input_queue: InputQueue,
-    pub(crate) guardian_review_session: GuardianReviewSessionManager,
-    pub(crate) services: SessionServices,
-    // ...
-}
+## 调用方拥有，还是内核拥有？
+
+两种选择：
+
+```mermaid
+flowchart TD
+    subgraph A["方案 A：调用方拥有"]
+        A1["CLI 发消息"] --> A2["Agent 回复"]
+        A2 --> A3["对话结束"]
+        A4["下次重新来"]
+    end
+    subgraph B["方案 B：内核拥有"]
+        B1["CLI 投递操作"] --> B2["Session 事件循环"]
+        B2 --> B3["Turn 执行"]
+        B3 --> B4["Turn 结束"]
+        B4 --> B2
+        B5["中断"] --> B2
+    end
 ```
 
-Session 创建时启动一个后台 tokio task（`submission_loop`），这个 task 就是 Session 的"心跳"：
+方案 A 简单：请求-响应，无状态，调用方控制一切。ChatGPT 网页版就是这样——你发一条，它回一条，没有"进行中"的概念。
 
-```rust
-// codex-rs/core/src/session/handlers.rs:695
-pub(super) async fn submission_loop(
-    sess: Arc<Session>,
-    config: Arc<Config>,
-    rx_sub: Receiver<Submission>,
-) {
-    while let Ok(sub) = rx_sub.recv().await {
-        match sub.op {
-            Op::UserInput { .. } => {
-                user_input_or_turn(&sess, sub.id, sub.op, ...).await;
-            }
-            Op::Interrupt => { interrupt(&sess).await; }
-            Op::Shutdown => { /* 退出循环 */ }
-            // ...
-        }
-    }
-}
+方案 B 复杂：Session 是一个长生命周期的有状态对象，有自己的事件循环。调用方不能"等待回复"，只能往 channel 里投递操作，然后订阅事件流自己判断发生了什么。
+
+Codex 选了 B。为什么？因为 coding agent 和聊天机器人有一个本质区别：**coding agent 的一次"回答"可能包含 20 次工具调用、持续 3 分钟。** 在这 3 分钟里，用户可能想中断、想追加指令、想关掉终端明天继续。这些需求在方案 A 里做不到。
+
+## Session 的心跳：submission_loop
+
+Session 创建时启动一个后台 tokio task，叫 `submission_loop`。它就是 Session 的心跳——只要 Session 活着，这个循环就在跑：
+
+```mermaid
+flowchart TD
+    A["submission_loop 启动"] --> B["等待 channel 消息"]
+    B --> C{"消息类型？"}
+    C -->|UserInput| D["启动新 Turn"]
+    C -->|Interrupt| E["中断当前 Turn"]
+    C -->|Shutdown| F["退出循环，Session 结束"]
+    D --> B
+    E --> B
 ```
 
-调用方和 Session 之间只有两个 channel：`tx_sub`（投递操作）和 `rx_event`（接收事件）。调用方不能"等待回复"——它只能订阅事件流，自己判断 turn 是否结束。
+调用方（CLI、IDE 插件、TUI）和 Session 之间只有两根管道：一根投递操作（`tx_sub`），一根接收事件（`rx_event`）。调用方不能"同步等回复"——它只能订阅事件流，看到 `TurnComplete` 事件时知道这轮结束了。
 
-## Turn：Session 内部的有界循环
+这个设计让 TUI、IDE 插件、子 agent 可以用同一套接口。它们只是订阅事件流的方式不同。
 
-一个 Turn 从 `run_turn` 开始，到模型不再请求工具调用（或发生错误/中断）时结束：
+## Turn：一次有界的执行
 
-```rust
-// codex-rs/core/src/session/turn.rs:144
-pub(crate) async fn run_turn(
-    sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
-    input: Vec<TurnInput>,
-    cancellation_token: CancellationToken,
-) -> CodexResult<Option<String>> {
-    // 1. 预压缩（如果上下文快满了）
-    run_pre_sampling_compact(&sess, &turn_context, ...).await?;
-    // 2. 捕获 step context，记录 world state
-    let first_step_context = sess.capture_step_context(...).await;
-    // 3. 主循环
-    loop {
-        let step_context = sess.capture_step_context(...).await;
-        let result = run_sampling_request(...).await;
-        match result {
-            Ok(output) if output.needs_follow_up => continue,  // 模型还要调工具
-            Ok(_) => break,                                     // 模型说完了
-            Err(TurnAborted) => return Err(...),                // 被中断
-            Err(e) => { /* 发错误事件 */ break; }
-        }
-    }
-}
+一个 Turn 从用户输入开始，到模型不再请求工具调用时结束。中间可能经历很多"步"（每步 = 一次模型调用 + 可能的工具执行）：
+
+```mermaid
+flowchart TD
+    A["用户输入"] --> B["Step 1：模型调用"]
+    B --> C{"模型要调工具？"}
+    C -->|是| D["执行工具，结果回注历史"]
+    D --> E["Step 2：再次调用模型"]
+    E --> C
+    C -->|否| F["Turn 结束"]
+    G["用户按 Ctrl+C"] -.->|"中断"| F
 ```
 
-关键设计：`needs_follow_up` 为 true 意味着模型请求了工具调用，工具已执行，结果已回注历史，循环继续。为 false 意味着模型只输出了文本，turn 结束。
+Turn 的结束条件只有一个：模型输出了纯文本（没有 tool call），或者被中断/出错。没有"最多跑 N 步"的硬限制——模型自己决定什么时候停。
 
-## 为什么 Session 和 Turn 必须分开
+## 为什么必须分开
 
-一个 Session 可以有多个 Turn。Turn 之间共享：
+一个 Session 可以有多个 Turn。它们共享对话历史、配置、审批状态。但每个 Turn 有自己独立的取消令牌和上下文快照。
 
-- 对话历史（`conversation`）
-- 配置（`SessionConfiguration`）
-- 审批状态（`guardian_review_session`）
-- 输入队列（`input_queue`）
+这意味着：
 
-但每个 Turn 有自己独立的：
+- 中断一个 Turn 不杀 Session——用户可以继续对话
+- 子 agent 就是一个独立的 Session——父 agent 通过 channel 和它通信，不需要特殊机制
+- Session 的 rollout 可以序列化到磁盘——关掉终端，明天打开，对话还在
 
-- `TurnContext`（模型信息、sub_id、terminal_error）
-- `CancellationToken`（可以被独立中断）
-- `StepContext`（每步重建的环境快照）
+## 代价
 
-这意味着：用户可以在一个 turn 结束后发新消息开启新 turn，历史自然延续；也可以在 turn 进行中通过 `Op::Interrupt` 中断当前 turn，Session 本身不死。
+Session 是重量级对象。它持有 Mutex、watch channel、Arc 引用计数、input queue。如果你只想做一个"问一句答一句"的轻量 bot，这套东西是过度设计。
 
-## 取舍
+另一个代价：调用方失去了对 Turn 边界的直接控制。你不能说"等这条消息的回复"——你只能订阅事件流，自己判断 `TurnComplete` 是否到达。对于习惯了 `await response` 的开发者，这个心智转换不自然。
 
-**得到什么**：
+还有一个隐含约束：`submission_loop` 是串行的。一个 Session 同一时刻只能跑一个 Turn。想并行？spawn 子 agent，每个子 agent 是独立的 Session。
 
-- 跨 turn 的上下文连续性——不需要调用方自己管理历史
-- 中断恢复——中断一个 turn 不杀 Session，用户可以继续对话
-- 持久化——Session 的 rollout 可以序列化到磁盘，重启后恢复
-- 多 agent——子 agent 就是一个独立的 Session，父 agent 通过 channel 和它通信
+## 回到那个 Ctrl+C
 
-**放弃什么**：
+现在你能理解为什么中断不丢状态了：Session 拥有对话历史，Turn 只是 Session 内部的一次有界执行。中断杀的是 Turn，不是 Session。历史在 Session 里，不在 Turn 里。
 
-- Session 是重量级对象（Mutex、watch channel、Arc 引用计数），不适合"一问一答"的轻量场景
-- 调用方失去了对 turn 边界的直接控制——不能"等这条消息的回复"，只能订阅事件流自己判断
-- submission_loop 是单线程串行的——一个 Session 同一时刻只能跑一个 turn
+这个决策的连锁反应很大：它决定了 Codex 的持久化方式（序列化 Session 而非 Turn）、多 agent 通信方式（Session 间 channel 而非函数调用）、以及上下文管理方式（baseline 属于 Session，diff 属于 Turn 内的 step）。
 
-## 对读者的启示
-
-如果你要做一个 coding agent，第一个设计决策不是"用什么模型"，而是"谁拥有对话的生命周期"。
-
-- 如果调用方拥有（无状态 API），你得到简单性，但失去跨 turn 连续性、中断恢复、持久化。
-- 如果内核拥有（有状态 Session），你得到上述所有能力，但必须设计好 channel 协议和事件流格式，让调用方能"观察"而非"控制"。
-
-Codex 选了后者。这个选择让 TUI、IDE 插件、子 agent 都可以用同一套 Session 接口，只是订阅事件流的方式不同。
+第一个设计决策不是"用什么模型"，而是"谁拥有对话"。后面的所有架构，都是这个选择的推论。
 
 ---
 
