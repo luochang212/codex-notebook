@@ -18,7 +18,7 @@ Codex 没有这样做。它的选择让我第一次看源码时有点意外。
 
 注意终点：角色的 description 最终出现在**父 agent 的工具描述**里，而不是子 agent 的 system prompt 里。父 agent 看到"Available roles: explorer - 用于代码库问题…"这段文字后，自己决定"我应该 spawn 一个 explorer"。
 
-子 agent 呢？它完全不知道自己被标记成了什么“角色”。没有额外的 system prompt，没有行为约束，没有权限收窄。它的行为完全由 config 决定。
+子 agent 呢？角色的 description 不会注入它的 system prompt。没有额外的行为约束，没有权限收窄。但角色不是完全丢弃的——它写入 SessionSource 元数据，V2 恢复时会根据 role 重新应用配置。行为差异来自 role config（配置文件），而不是名字本身。
 
 换句话说，Codex 的“角色”不是子 agent 的身份，而是父 agent 的使用说明书。这就像餐厅菜单上写的“推荐搭配”——它告诉点菜的人怎么选，但厨房不会因为菜单上写了“清淡”就少放盐。
 
@@ -71,7 +71,7 @@ flowchart TD
 
 角色系统这么轻量，会不会出问题？最容易想到的是：一个 agent spawn 子 agent，子 agent 又 spawn 孙 agent，无穷无尽。
 
-Codex 用一个极其简单的深度计数来解决：
+Codex 的 V1 多 agent 用一个极其简单的深度计数来解决：
 
 ```rust
 // codex-rs/core/src/agent/registry.rs:70-76
@@ -84,7 +84,9 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 ```
 
-每个子 agent 的 SessionSource 记录了它被 spawn 时的深度。超过上限就拒绝。没有复杂的资源核算、没有令牌桶、没有优先级队列——就是一个整数比较。对于当前的使用场景（深度通常不超过 3-4 层），这完全够用。
+每个子 agent 的 SessionSource 记录了它被 spawn 时的深度。超过上限就拒绝。
+
+V2 多 agent 没有这个深度检查。它用另一套机制控制资源：resident capacity（同时存活的 agent 数量上限）和 LRU 驱逐（ch11）。深度限制对 V1 够用，V2 的容量模型更关心"同时有多少个在跑"而不是"嵌套了几层"。
 
 ## 这个设计到底在赌什么？
 

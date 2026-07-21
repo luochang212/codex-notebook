@@ -10,15 +10,20 @@ sidebar_label: 8. 执行策略与沙箱
 
 ## 第一道：这条命令本身允许跑吗？
 
-exec policy 是一个规则引擎，对每条命令做匹配：
+exec policy 是一个多维决策引擎。它不是简单的白名单/黑名单，而是综合多个输入做判断：
 
-- 白名单（`cargo build`、`git status`、`npm test`）：直接放行
-- 黑名单（`rm -rf /`、`curl | bash`）：直接拒绝
-- 未匹配：根据 approval_policy 决定是自动放行还是请求用户审批
+- 显式 policy rule（用户或管理员配置的 allow/deny 规则）
+- 危险命令启发式（识别 `rm -rf`、`curl | bash` 这类模式）
+- known-safe 启发式（识别 `cargo build`、`git status` 这类常见安全命令）
+- 当前 approval policy（用户选择的审批策略）
+- permission profile 和 sandbox 形态
+- 命令解析结果（是否用了复杂解析路径）
 
-`cargo build` 在白名单里。第一道过了。
+最终输出三种结果之一：`Forbidden`（直接拒绝）、`NeedsApproval`（需要审批）、`Skip`（放行）。
 
-但这里有一个微妙的设计：exec policy 可以被运行时修改。用户审批通过一条命令后，系统可以把它加入白名单，后续不再询问。这意味着白名单是生长的——用得越多，弹框越少。
+`cargo build` 大概率被 known-safe 启发式识别为安全。第一道过了。
+
+审批通过后，部分情况下系统可以派生出一条 amendment（类似“以后这类命令不用再问”）。但不是所有审批都会生长规则——如果命令用了复杂解析路径（比如 heredoc fallback），自动 amendment 会被禁用，因为无法安全地泛化这条命令。
 
 ## 第二道：跑的时候能碰什么？
 
@@ -32,7 +37,9 @@ exec policy 是一个规则引擎，对每条命令做匹配：
 | macOS | seatbelt (sandbox-exec) | 文件系统、网络 |
 | Windows | windows-sandbox | 文件系统、注册表 |
 
-核心约束只有三条：
+沙箱不是不可配置的固定约束。`SandboxPolicy` 有多个变体（ReadOnly、WorkspaceWrite、DangerFullAccess、ExternalSandbox），每个变体有自己的字段。比如 WorkspaceWrite 可以配置额外可写目录，也有 `network_access` 字段控制网络是否开放。
+
+典型配置下的核心约束：
 
 1. 工作目录可写，其他目录只读或不可见
 2. 网络默认禁止所有出站连接，白名单放行
@@ -42,13 +49,13 @@ exec policy 是一个规则引擎，对每条命令做匹配：
 
 但如果 build script 里写了 `std::fs::write("/etc/passwd", ...)`——沙箱拒绝。工作目录外的写操作，直接失败。进程不会崩溃，只是那个 write 调用返回 permission denied。
 
-## 第三道：能访问什么地址？
+## 网络控制：不一定是独立的第三层
 
-网络策略独立于文件系统沙箱。即使沙箱允许了网络访问，网络策略仍然可以按域名/IP 粒度拦截。
+网络策略的实现方式取决于配置。它可能是 sandbox policy 的一个字段（`network_access: bool`），也可能通过受管的 permission/proxy 机制实现。不是所有环境都有同一个独立的网络层。
 
-`cargo build` 要访问 crates.io 下载依赖。网络策略检查：crates.io 在白名单里吗？如果是，放行。如果不是，连接被拒绝，cargo 报错"无法下载依赖"。
+`cargo build` 要访问 crates.io 下载依赖。如果当前 sandbox policy 开放了网络，放行。如果网络被禁止，连接被拒绝，cargo 报错"无法下载依赖"。
 
-三层是串行的：exec policy 先过，然后 sandbox 包裹进程，然后网络策略过滤出站连接。任何一层拒绝，操作就失败。
+三层的关系不是固定流水线，而是根据当前配置组合决策。exec policy 先过，然后 sandbox 包裹进程，网络控制可能是 sandbox 的一部分也可能是独立机制。任何一层拒绝，操作就失败。
 
 ## 为什么三层而不是一层？
 
@@ -66,7 +73,7 @@ exec policy 看的是命令字符串——它能拦截 `rm -rf /`，但拦不住
 
 有了沙箱，在沙箱内模型可以自由执行命令。不需要逐条审批。因为即使它跑了什么奇怪的东西，沙箱会拦住真正危险的操作。用户只需要看结果。
 
-full-auto 模式的前提是沙箱。没有沙箱，就没有 full-auto。
+sandbox policy 和 approval policy 是两个独立的维度。sandbox 决定"进程能碰什么"，approval 决定"哪些操作需要人确认"。它们的组合决定了 agent 的实际自主程度。
 
 ## 代价
 

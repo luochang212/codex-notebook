@@ -12,9 +12,9 @@ sidebar_label: 13. MCP 与插件
 
 ## 一个进程边界
 
-答案很朴素：把第三方工具放在独立进程里。
+答案很朴素：把第三方工具放在独立的运行时里。
 
-MCP server 就是一个独立进程。它可以用 Python 写，可以用 Go 写，可以跑在本机，也可以跑在远端。agent 通过 stdio 或 HTTP 跟它说话，说的内容是 JSON-RPC：「调用这个工具，参数是这些」。server 干完活，把结果用 JSON 回传。
+MCP server 有两种 transport。Stdio transport 启动一个本地子进程，通过标准输入输出通信。StreamableHttp transport 连接一个远程 HTTP 服务，不是 Codex 创建的进程。两种情况下，agent 说的都是 JSON-RPC：「调用这个工具，参数是这些」。server 干完活，把结果用 JSON 回传。
 
 agent 不知道 server 的实现语言。server 不知道 agent 的内部结构。它们之间只有一份合同：tool schema（name + description + parameters）。
 
@@ -42,9 +42,9 @@ MCP server 注册的工具里，有些是给编排层用的（比如健康检查
 
 一个常见误解：外部工具应该被更严格地审批。
 
-Codex 没有这样做。MCP 工具调用经过和内建工具**相同的**审批链路：exec policy 检查 → guardian 审批（如果启用）→ 用户审批（如果需要）。不因为是"外部的"就加一层，也不因为"已经通过 MCP 协议了"就减一层。
+Codex 没有这样做。但 MCP 工具也不是走和内建 shell 相同的 exec policy 链路。MCP 有自己独立的审批体系：tool approval mode、app policy、annotation 判断、session/persistent remembered approval、permission hook，以及可选的 Guardian/user elicitation。不因为是“外部的”就加一层，也不因为“已经通过 MCP 协议了”就减一层。
 
-这背后有一个判断：审批的对象是**操作的后果**，不是**工具的来源**。`git push --force` 不管是内建工具调的还是 MCP 工具调的，后果一样。
+这背后有一个判断：审批的对象是**操作的后果**，不是**工具的来源**。`git push --force` 不管是内建工具调的还是 MCP 工具调的，后果一样。但审批的实现路径不同——MCP 有自己的 approval mode 配置，不是先拿命令去匹配 exec policy。
 
 但有一个 MCP 特有的安全边界值得注意：审批能控制"是否调用"，不能控制"调用结果是否可信"。一个恶意 MCP server 可以返回误导性结果——比如告诉你"测试全部通过"但其实没跑。agent 没有能力验证外部 server 的返回值。这是信任边界。
 
@@ -58,19 +58,19 @@ required server 启动失败，整个 session 报错，不进入对话。optiona
 
 ## 插件：MCP 的打包分发
 
-`PluginsManager` 在 MCP 之上加了一层薄包装：一个 plugin = 一个预配置的 MCP server + 可选的 skill 文件。
+`PluginsManager` 在 MCP 之上加了一层薄包装：一个 plugin 可以包含多个 MCP server、多个 skill、apps、hooks 和 interface 信息。
 
-它不是另一种协议。它解决的是"怎么把 MCP server 打包给用户安装"的问题。用户不需要手动编辑 config 文件写 server 地址和参数——安装一个 plugin 就行。
+它不是另一种协议。它解决的是“怎么把 MCP server + skill + hooks 打包给用户安装”的问题。用户不需要手动编辑 config 文件写 server 地址和参数——安装一个 plugin 就行。
 
 skill + MCP server 的组合也自然：skill 告诉模型"什么时候该用这个工具、用的时候注意什么"，MCP server 提供实际执行能力。知识 + 能力，文档 + 进程。
 
 ## 代价
 
-每次工具调用都跨进程。stdio 通信的延迟在毫秒级，HTTP 在几十毫秒级。对于"读一个文件"这种操作，内建工具微秒级完成，MCP 工具要多走一圈。
+Stdio transport 下，每次工具调用都跨进程。延迟在毫秒级。StreamableHttp transport 下，延迟在几十毫秒级。对于“读一个文件”这种操作，内建工具微秒级完成，MCP 工具要多走一圈。
 
 调试变难了。问题可能在 agent 侧（路由错误）、MCP client 侧（序列化失败）、MCP server 侧（逻辑 bug）。三层栈，每层有自己的日志。
 
-每个 server 是独立进程，有启动时间。10 个 server 的冷启动可能需要几秒。
+Stdio transport 下，每个 server 是独立进程，有启动时间。10 个 server 的冷启动可能需要几秒。StreamableHttp transport 没有这个问题——远端服务已经在跑了。
 
 换来的：任何语言都能写 MCP server。server 崩溃不影响 agent 主进程。工具生态可以独立于 agent 版本演进。
 

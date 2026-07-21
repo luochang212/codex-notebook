@@ -32,7 +32,7 @@ Codex 的解法是 `apply_patch`：不是"写入文件"，而是"在文件中找
 
 这是最微妙的一点。工具的 description 不是写给人看的文档——它是写给模型看的行为指令。
 
-`apply_patch` 的 spec 里会写："必须先 read 文件确认当前内容，再 apply patch"、"不要猜测文件内容"、"每次只修改一个文件"。这些约束不是运行时强制的——模型可以违反。但它们大幅降低了模型犯错的概率。
+`apply_patch` 的 spec 很简短：它告诉模型这个工具用于编辑文件，格式是 FREEFORM，不要包在 JSON 里。行为引导（“先 read 再 patch”“不要猜测文件内容”）不在工具 spec 里，而在 system prompt 的指令中。工具 spec 定义“这个工具是什么、参数怎么传”，system prompt 定义“应该怎么用”。
 
 一个 bash 工具的 spec 能写什么？"请安全地使用 shell"？这等于没说。结构化工具的 spec 是具体的、可操作的行为引导，而不是笼统的"注意安全"。
 

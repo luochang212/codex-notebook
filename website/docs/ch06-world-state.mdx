@@ -50,22 +50,26 @@ WorldState 是一个 section 集合。每个 section 对应一类环境信息：
 
 每步构建完新的 WorldState 后，和上一步的 snapshot 逐 section 比较。只有内容变了的 section 才会被渲染成文本追加到对话历史。
 
-持久化层也做 diff：首次记录 `WorldStateItem::full`（全量快照），后续记录 `WorldStateItem::patch`（JSON merge patch）。rollout 文件不会膨胀。
+持久化层也做 diff：首次记录 `WorldStateItem::full`（全量快照），后续记录 `WorldStateItem::patch`（JSON merge patch）。patch 通常比全量小，但每次变化仍会新增 rollout item——文件仍然增长，只是慢。
 
 ## baseline 什么时候重置？
 
 两种情况：
 
 1. **Compaction**（ch05）：压缩后旧历史被摘要替代，baseline 必须重置为压缩时刻的完整 WorldState。否则后续 diff 基于一个已经不存在的基准。
-2. **Turn 结束**：新 turn 的第一步重新全量注入，设新 baseline。
+2. **Rollback**：如果回滚裁掉了包含初始上下文的 developer bundle，`reference_context_item` 被清空，下一步会重新全量注入并建立新 baseline。
+
+注意：正常 Turn 结束**不会**重置 baseline。baseline 跨 Turn 保留在 Session 中。第二个 Turn 开始时，系统仍然基于已有 baseline 做 diff，而不是重新全量注入。
 
 这里有一个真实的风险：如果 compaction 时 baseline 处理不当（比如丢了某个 section），后续 diff 就会基于错误的基准，模型可能看到不完整的环境信息。这是 baseline/diff 机制最脆弱的地方。
 
 ## 为什么不直接用 git diff 的思路？
 
-其实很像。但有一个区别：git diff 是文本级的（行级 diff），WorldState 的 diff 是 **section 级**的。一个 section 要么整体变了（重新注入整个 section），要么没变（不注入）。不做 section 内部的行级 diff。
+其实很像。但有一个区别：git diff 是文本级的（行级 diff），WorldState 的 diff 主要是 **section 级**的。大多数 section 要么整体变了（重新注入），要么没变（不注入）。
 
-为什么？因为 section 通常很短（几十到几百 token），行级 diff 的收益很小，但实现复杂度大增。而且模型不需要知道"git status 的第 3 行变了"，它只需要看到最新的 git status。
+但不是所有 section 都这么粗暴。`EnvironmentsState` 会逐个比较每个 environment，只渲染新增、变化或不可用的条目，而不是 section 一变就把所有内容原样重发。
+
+为什么大多数 section 不做行级 diff？因为 section 通常很短（几十到几百 token），行级 diff 的收益很小，但实现复杂度大增。而且模型不需要知道"git status 的第 3 行变了"，它只需要看到最新的 git status。
 
 ## 一句话
 

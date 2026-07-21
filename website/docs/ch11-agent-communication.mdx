@@ -6,7 +6,7 @@ sidebar_label: 11. 通信与回收
 
 你给三个同事分别布置了一个任务。然后你继续干自己的事。某个同事做完了，他不会拍你肩膀说"嘿，我做完了"——他会在你的收件箱里放一张备忘录。你下次查看收件箱时看到它，然后决定下一步。
 
-Codex 的多 agent 通信就是这个模型。子 agent 完成后不会"回调"父 agent，不会中断父 agent 的当前工作。它只是往父 agent 的 input queue 里塞了一条消息。父 agent 下次空闲时看到它，就像看到一条普通的用户输入一样处理。
+Codex 的多 agent 通信就是这个模型。子 agent 完成后不会“回调”父 agent，不会中断父 agent 的当前工作。它只是往父 agent 的 input queue 里塞了一条消息。如果父 agent 当前有 active turn，消息会进入该 turn 的 pending input，模型在下一次采样前就能取到它。如果父 agent 空闲，消息就安静地等着，触发后续处理。
 
 没有 RPC，没有服务发现，没有消息队列。多 agent 通信被还原成了单 agent 的输入处理。
 
@@ -16,7 +16,7 @@ V1 协议下，spawn 子 agent 时系统会启动一个 detached 的 completion 
 
 等什么呢？等子 agent 的状态变成 final——Completed、Errored、或 Interrupted。一旦状态变为 final，watcher 构造一条通知消息（包含子 agent 的引用名和最终状态），然后调用 `inject_user_message_without_turn` 把消息塞进父 agent 的 input queue。
 
-关键：这条消息不会立即触发父 agent 的新 turn。它只是排队。父 agent 可能正在忙别的事，这条消息就安静地等着。等父 agent 下次空闲，它会被当作一条普通的用户输入处理。
+关键：如果父 agent 正在跑 turn，`inject_if_running` 会把消息放进当前 turn 的 pending input，模型在下一次采样前就能取到它并继续同一个 turn。如果父 agent 空闲，消息会触发后续处理路径。
 
 watcher 是一次性的。通知发完，它就消失了。如果 watcher 在子 agent 完成前崩溃了，通知丢失。没有重试机制。
 
@@ -42,15 +42,15 @@ V2 子 agent 完成后不会被立即销毁。它进入"resident"状态，保留
 
 这意味着：如果父 agent 和很多子 agent 交互频繁，完成通知会不断累积，直到触发 compaction 被摘要压缩。系统不为通知设计独立的清理逻辑——复用已有的 compaction 机制，少一套代码。
 
-## 为什么不用 RPC？
+## 为什么默认是异步的？
 
-因为 RPC 要求父 agent "等待"子 agent。但 Codex 的 Session 是串行的——一个 Session 同一时刻只能跑一个 turn。如果父 agent 阻塞等待子 agent，它就什么都做不了了。
+因为 Codex 的 Session 是串行的——一个 Session 同一时刻只能跑一个 turn。如果父 agent 默认阻塞等待子 agent，它就什么都做不了了。
 
-消息传递模型让父 agent 完全解耦：它不需要知道子 agent 的内部结构，不需要等待，不需要处理回调。它只需要在下次处理输入时，看到收件箱里多了一条消息。
+消息传递模型让父 agent 默认解耦：它不需要知道子 agent 的内部结构，不需要处理回调。它只需要在下次处理输入时，看到收件箱里多了一条消息。
 
-代价是：父 agent 不能"同步等待子 agent 的结果"。如果你需要"父 agent 阻塞直到子 agent 返回"，这个设计不适合你。但 Codex 的场景是异步的：父 agent 继续工作，子 agent 结果稍后到达。就像你给同事布置任务后不会站在旁边等，而是回去干自己的事。
+但如果确实需要同步等待呢？V1 和 V2 都提供了 `wait_agent` 工具。父 agent 可以显式调用它，阻塞当前这次工具调用，直到子 agent 完成或超时。这不是默认行为——它是一个显式选择。大多数时候父 agent 继续干自己的事，但如果任务逻辑要求“等子 agent 的结果再决定下一步”，工具在那里。
 
-子 agent 的结果不是"返回"给父 agent，而是"发生"在父 agent 的输入流里。这一句话就是整个多 agent 通信的设计哲学。
+子 agent 的结果不是“返回”给父 agent，而是“发生”在父 agent 的输入流里。这一句话就是整个多 agent 通信的设计哲学。
 
 ---
 

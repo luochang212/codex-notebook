@@ -22,7 +22,7 @@ Reconnecting... 2/5
 
 ## 第一层：同一条路，再试几次
 
-网络抖了、服务端短暂过载——这类瞬态故障，等一等再试就好了。Codex 用指数退避重试：第一次等 1 秒，第二次等 2 秒，第三次等 4 秒……最多 N 次。
+网络抖了、服务端短暂过载——这类瞬态故障，等一等再试就好了。Codex 用指数退避重试：初始等待 200ms，每次乘以 2，并加一个 0.9–1.1 的随机抖动避免雷群效应。最多 N 次。
 
 用户看到的 "Reconnecting... 2/5" 就是这层在工作。它没有换路，只是在同一条路上等红灯。
 
@@ -77,7 +77,8 @@ flowchart TD
 所以：
 
 - `ModelClient`：活整个 Session，持有认证、provider 配置。不变的东西。
-- `ModelClientSession`：每个 Turn 创建一个，缓存 WebSocket 连接和 sticky token。Turn 结束就丢弃。
+- `ModelClientSession`：每个 Turn 创建一个，缓存 sticky token。Turn 结束就丢弃。
+- WebSocket 连接：Session 级复用。Turn 结束时连接被存回 Session 缓存，下一个 Turn 取出来继续用。不是每个 Turn 重新建连。
 
 如果 `ModelClientSession` 跨 turn 复用，上一个 turn 的 token 就会泄漏到下一个 turn，违反客户端/服务端契约。这个 bug 很隐蔽——不会报错，只是路由不对，推理质量可能下降。
 

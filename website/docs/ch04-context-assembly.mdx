@@ -14,9 +14,9 @@ Codex 的上下文构造就是这个逻辑。模型每次被调用时看到的"s
 
 ## 为什么前缀不能变
 
-OpenAI 和 Anthropic 的 API 都有 prompt cache：如果你这次请求的前缀和上次一样，服务端可以复用已缓存的 KV cache，不用重新计算。这能省 50-90% 的 token 费用。
+OpenAI 和 Anthropic 的 API 都有 prompt cache：如果你这次请求的前缀和上次一样，服务端可以复用已缓存的 KV cache，不用重新计算。前缀稳定时，费用显著降低。
 
-但命中条件是**前缀逐字节相同**。如果你在 system prompt 中间插了一段变化的内容（比如 git status），前缀就变了，cache 全部 miss。
+但命中条件是**前缀逐字节相同**。如果你在 system prompt 中间插了一段变化的内容（比如 git status），前缀就变了，cache 就 miss。
 
 所以规则很简单：**不变的信息放前面，变化的信息追加在后面。**
 
@@ -44,21 +44,23 @@ flowchart TD
 
 用报纸类比：记者每步都出去采访（重建 WorldState），但只有采访到了**新东西**，才会见报（注入上下文）。如果环境完全没变，这步什么都不追加。
 
-## 首次全量，后续增量
+## 没有 baseline 时全量，有 baseline 后增量
 
-第一步（turn 的第一个 model step）是特殊的：它注入所有东西——base instructions、完整的 world state、MCP 工具列表、可用 skills。这是"底版"。
+Session 的第一个 Turn（或者 compaction / rollback 之后 baseline 被清空时），系统做一次全量注入：base instructions、完整的 world state、MCP 工具列表、可用 skills。这是"底版"。注入完成后，当前快照成为 baseline。
 
-后续步骤只做 diff：和 baseline 比较，只注入变化的部分。
+从第二个 Turn 开始，baseline 已经存在于 Session 中。后续每步只做 diff：和 baseline 比较，只注入变化的部分。baseline 跨 Turn 保留，不需要每个 Turn 重新全量。
 
 ```mermaid
 flowchart TD
-    A{"是第一步？"} -->|是| B["全量注入：base + world state + MCP + skills"]
+    A{"Session 中有 baseline？"} -->|没有| B["全量注入：base + world state + MCP + skills"]
     B --> C["设为 baseline"]
-    A -->|否| D["和 baseline 做 diff"]
+    A -->|有| D["和 baseline 做 diff"]
     D --> E{"有变化？"}
     E -->|是| F["只追加变化部分"]
     E -->|否| G["什么都不注入"]
 ```
+
+什么时候 baseline 会被清空？两种情况：compaction 重写了历史窗口（ch05），或者 rollback 裁掉了包含初始上下文的 developer bundle。正常对话中，baseline 从第一个 Turn 建立后就一直延续。
 
 这不是为了省 token（虽然确实省了）。核心目的是**保护前缀不变**。如果每步都全量重建，前缀就变了，cache 就 miss。只追加 diff，前缀不动，cache 命中。
 
@@ -87,7 +89,7 @@ flowchart TD
 
 **实现复杂度。** baseline/diff 比"每次全量拼"复杂得多。需要维护 baseline、做 diff、处理 baseline 重置（compaction 后，见 ch05）。
 
-**但换来的是：** 一个 20 步的 turn，前 19 步的 cache 都命中。如果用全量重建，20 步全部 miss。对于长 turn（coding agent 的典型场景），这个差距是几十倍的 token 费用。
+**但换来的是：** 一个长 turn 里，前缀稳定不变，服务端 cache 可以持续复用。如果用全量重建，每步前缀都不同，cache 无法命中。对于长 turn（coding agent 的典型场景），这是数量级的 token 费用差距。
 
 ## 一句话总结
 
