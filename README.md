@@ -1,8 +1,10 @@
 # Codex 设计原理
 
-<img src="https://img.shields.io/badge/language-Chinese-brightgreen?style=flat" alt="Language"/>
-<img src="https://img.shields.io/github/license/luochang212/codex-notebook?style=flat" alt="license"/>
-<a href="https://github.com/luochang212/codex-notebook/actions/workflows/deploy.yml"><img src="https://img.shields.io/github/actions/workflow/status/luochang212/codex-notebook/deploy.yml?branch=main&label=CI&style=flat" alt="CI"/></a>
+<div>
+  <img src="https://img.shields.io/badge/language-Chinese-brightgreen?style=flat" alt="Language"/>
+  <img src="https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey?style=flat" alt="license"/>
+  <a href="https://github.com/luochang212/codex-notebook/actions/workflows/deploy.yml"><img src="https://img.shields.io/github/actions/workflow/status/luochang212/codex-notebook/deploy.yml?branch=main&label=CI&style=flat" alt="CI"/></a>
+</div>
 
 一直好奇 [Codex](https://github.com/openai/codex) 是如何工作的。这不阿里发了 Qwen 3.8，就用它蹬了一本《Codex 设计原理》。
 
