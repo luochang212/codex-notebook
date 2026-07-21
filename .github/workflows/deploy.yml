@@ -1,4 +1,4 @@
-name: Deploy ebook to GitHub Pages
+name: deploy
 
 on:
   push:
