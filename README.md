@@ -1,11 +1,5 @@
 # Codex 设计原理
 
-<div>
-  <img src="https://img.shields.io/badge/language-Chinese-brightgreen?style=flat" alt="Language"/>
-  <img src="https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey?style=flat" alt="license"/>
-  <a href="https://github.com/luochang212/codex-notebook/actions/workflows/deploy.yml"><img src="https://img.shields.io/github/actions/workflow/status/luochang212/codex-notebook/deploy.yml?branch=main&label=CI&style=flat" alt="CI"/></a>
-</div>
-
 一直好奇 [Codex](https://github.com/openai/codex) 是如何工作的。这不阿里发了 Qwen 3.8，就用它蹬了一本《Codex 设计原理》。
 
 最初蹬出来的效果很差。我修了两轮：一轮修语言风格，一轮修正确性。但都不是提升洞察深度的修法，能挖多深，还是要靠模型自身的功力。所以这也是 Qwen 模型能力的有效参考！
@@ -54,4 +48,3 @@ npm run start
 ## 开源协议
 
 本作品采用 [知识共享署名-非商业性使用-相同方式共享 4.0 国际许可协议](http://creativecommons.org/licenses/by-nc-sa/4.0/) 进行许可。
-
