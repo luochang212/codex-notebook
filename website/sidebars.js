@@ -12,9 +12,9 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch01-session-turn',
-        'qa/ch02-model-call',
-        'qa/ch03-tool-loop',
+        'ch01-session-turn',
+        'ch02-model-call',
+        'ch03-tool-loop',
       ],
     },
     {
@@ -23,9 +23,9 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch04-context-assembly',
-        'qa/ch05-cache-compaction',
-        'qa/ch06-world-state',
+        'ch04-context-assembly',
+        'ch05-cache-compaction',
+        'ch06-world-state',
       ],
     },
     {
@@ -34,8 +34,8 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch07-tool-system',
-        'qa/ch08-exec-sandbox',
+        'ch07-tool-system',
+        'ch08-exec-sandbox',
       ],
     },
     {
@@ -44,7 +44,7 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch09-guardian',
+        'ch09-guardian',
       ],
     },
     {
@@ -53,8 +53,8 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch10-agent-roles',
-        'qa/ch11-agent-communication',
+        'ch10-agent-roles',
+        'ch11-agent-communication',
       ],
     },
     {
@@ -63,9 +63,9 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch12-skills',
-        'qa/ch13-mcp-plugins',
-        'qa/ch14-config-layers',
+        'ch12-skills',
+        'ch13-mcp-plugins',
+        'ch14-config-layers',
       ],
     },
     {
@@ -74,7 +74,7 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
-        'qa/ch15-philosophy',
+        'ch15-philosophy',
       ],
     },
   ],
