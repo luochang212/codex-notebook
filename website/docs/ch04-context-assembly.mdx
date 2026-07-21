@@ -16,7 +16,7 @@ Codex 的上下文构造就是这个逻辑。模型每次被调用时看到的"s
 
 OpenAI 和 Anthropic 的 API 都有 prompt cache：如果你这次请求的前缀和上次一样，服务端可以复用已缓存的 KV cache，不用重新计算。前缀稳定时，费用显著降低。
 
-但命中条件是**前缀逐字节相同**。如果你在 system prompt 中间插了一段变化的内容（比如 git status），前缀就变了，cache 就 miss。
+但命中条件是**前缀逐字节相同**。如果你在 system prompt 中间插了一段变化的内容（比如当前工作目录或权限配置），前缀就变了，cache 就 miss。
 
 所以规则很简单：**不变的信息放前面，变化的信息追加在后面。**
 
@@ -37,7 +37,7 @@ flowchart TD
 
 每个 model step 之前，`capture_step_context` 会重新收集所有环境信息：
 
-- AGENTS.md（可能因为 cd 到新目录而变化）
+- AGENTS.md（可能因为工作目录切换而变化）
 - MCP 工具列表（可能因为 server 启动/关闭而变化）
 - 环境选择（workspace roots、cwd）
 - 能力发现（executor capabilities）
@@ -46,7 +46,7 @@ flowchart TD
 
 ## 没有 baseline 时全量，有 baseline 后增量
 
-Session 的第一个 Turn（或者 compaction / rollback 之后 baseline 被清空时），系统做一次全量注入：base instructions、完整的 world state、MCP 工具列表、可用 skills。这是"底版"。注入完成后，当前快照成为 baseline。
+Session 的第一个 Turn（或者 rollback 裁掉了包含初始上下文的 developer bundle 时），系统做一次全量注入：base instructions、完整的 world state、MCP 工具列表、可用 skills。这是“底版”。注入完成后，当前快照成为 baseline。
 
 从第二个 Turn 开始，baseline 已经存在于 Session 中。后续每步只做 diff：和 baseline 比较，只注入变化的部分。baseline 跨 Turn 保留，不需要每个 Turn 重新全量。
 
@@ -60,7 +60,7 @@ flowchart TD
     E -->|否| G["什么都不注入"]
 ```
 
-什么时候 baseline 会被清空？两种情况：compaction 重写了历史窗口（ch05），或者 rollback 裁掉了包含初始上下文的 developer bundle。正常对话中，baseline 从第一个 Turn 建立后就一直延续。
+什么时候 baseline 会重置？Compaction 会在压缩过程中同步安装新的 baseline（不是清空后等下一步重建，而是压缩完成时新 baseline 已经就位）。Rollback 裁掉初始上下文后，`reference_context_item` 被清空，下一步会重新全量注入。正常对话中，baseline 从第一个 Turn 建立后就一直延续。
 
 这不是为了省 token（虽然确实省了）。核心目的是**保护前缀不变**。如果每步都全量重建，前缀就变了，cache 就 miss。只追加 diff，前缀不动，cache 命中。
 
@@ -73,13 +73,13 @@ flowchart TD
 | 基础指令 | 首次全量 | 整个 session 不变 |
 | AGENTS.md | 每步检查 | 偶尔（cd 或文件修改） |
 | 权限说明 | 配置变化时 | 很少 |
-| 环境信息（git status 等） | 每步 | 经常 |
+| 环境信息（cwd、权限、子 agent 列表等） | 每步 | 经常 |
 | 可用 skills | 首次或变化时 | 偶尔 |
 | MCP 工具 | 每步重建 | 偶尔 |
 | 子 agent 列表 | 每步（baseline/diff） | 经常（多 agent 模式） |
 | 时间提醒 | 周期性 | 固定间隔 |
 
-注意变化频率的差异：base instructions 整个 session 不变，git status 每步都变。如果把它们放在同一个"system prompt 模板"里，要么每步都变（cache miss），要么 git status 不更新（模型不知道环境变了）。baseline/diff 机制让不同频率的信息各得其所。
+注意变化频率的差异：base instructions 整个 session 不变，environment cwd 和子 agent 列表每步都可能变。如果把它们放在同一个“system prompt 模板”里，要么每步都变（cache miss），要么环境信息不更新（模型不知道环境变了）。baseline/diff 机制让不同频率的信息各得其所。
 
 ## 代价
 

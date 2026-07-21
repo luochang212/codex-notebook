@@ -4,7 +4,7 @@ title: 环境信息每步都变，怎么高效告诉模型？
 sidebar_label: 6. WorldState 与增量记录
 ---
 
-ch04 讲了上下文装配的总流程。这一章只聚焦其中一个子问题：环境信息（git status、子 agent 列表、AGENTS.md、权限配置）每步都可能变，怎么告诉模型？
+ch04 讲了上下文装配的总流程。这一章只聚焦其中一个子问题：环境信息（子 agent 列表、工作目录、AGENTS.md、权限配置）每步都可能变，怎么告诉模型？
 
 我用问答的方式推进。
 
@@ -20,7 +20,7 @@ ch04 讲了上下文装配的总流程。这一章只聚焦其中一个子问题
 
 也不行。模型不知道环境变了。
 
-比如模型在 step 3 执行了 `git checkout -b feature`，到 step 7 它需要知道当前分支已经变了。如果不告诉它，它可能基于错误的分支信息做决策。
+比如模型在 step 3 spawn 了一个子 agent，到 step 7 它需要知道当前有哪些子 agent 在跑、它们的状态如何。如果不告诉它，它可能重复 spawn 或基于过时的列表做决策。
 
 ## 所以答案是？
 
@@ -69,7 +69,7 @@ WorldState 是一个 section 集合。每个 section 对应一类环境信息：
 
 但不是所有 section 都这么粗暴。`EnvironmentsState` 会逐个比较每个 environment，只渲染新增、变化或不可用的条目，而不是 section 一变就把所有内容原样重发。
 
-为什么大多数 section 不做行级 diff？因为 section 通常很短（几十到几百 token），行级 diff 的收益很小，但实现复杂度大增。而且模型不需要知道"git status 的第 3 行变了"，它只需要看到最新的 git status。
+为什么大多数 section 不做行级 diff？因为 section 通常很短（几十到几百 token），行级 diff 的收益很小，但实现复杂度大增。而且模型不需要知道“子 agent 列表的第 3 项变了”，它只需要看到最新的列表。
 
 ## 一句话
 

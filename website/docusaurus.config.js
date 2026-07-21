@@ -4,8 +4,8 @@ import rehypeKatex from 'rehype-katex';
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'Codex 问答笔记',
-  tagline: '把关键问题整理成可继续深挖的 Codex 架构研究主题',
+  title: 'Codex 设计原理',
+  tagline: '从源码出发，拆解 Codex 架构中的每一个设计取舍',
   favicon: 'img/logo.svg',
 
   url: 'https://luochang212.github.io',
@@ -80,20 +80,20 @@ const config = {
         {
           name: 'description',
           content:
-            'Codex 问答笔记针对 openai/codex 代码库，把关键问题整理成可继续深挖的架构研究主题，覆盖上下文管理、压缩、缓存、工具治理和运行时边界。',
+            '《Codex 设计原理》从源码出发，拆解 openai/codex 架构中的每一个设计取舍，覆盖上下文管理、压缩、缓存、工具治理和运行时边界。',
         },
         { name: 'twitter:card', content: 'summary_large_image' },
       ],
       navbar: {
-        title: 'Codex Notebook',
+        title: 'Codex 设计原理',
         logo: {
-          alt: 'Codex Notebook Logo',
+          alt: 'Codex 设计原理 Logo',
           src: 'img/logo.svg',
         },
         items: [
           {
             href: 'https://github.com/luochang212/codex-notebook',
-            label: 'Codex Notebook',
+            label: 'GitHub',
             position: 'right',
           },
         ],
@@ -101,7 +101,7 @@ const config = {
 
       footer: {
         style: 'dark',
-        copyright: `Copyright © ${new Date().getFullYear()} Codex Notebook. Built with Docusaurus.`,
+        copyright: `Copyright © ${new Date().getFullYear()} Codex 设计原理. Built with Docusaurus.`,
       },
 
       mermaid: {
@@ -142,9 +142,9 @@ const config = {
       innerHTML: JSON.stringify({
         '@context': 'https://schema.org',
         '@type': 'WebSite',
-        name: 'Codex 问答笔记',
+        name: 'Codex 设计原理',
         url: 'https://luochang212.github.io/codex-notebook/',
-        description: '针对 openai/codex 代码库的架构与实现问题研究型问答笔记',
+        description: '从源码出发，拆解 openai/codex 架构中的设计取舍',
       }),
     },
   ],

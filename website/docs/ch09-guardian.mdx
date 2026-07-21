@@ -21,8 +21,9 @@ flowchart TD
     A["模型要执行一个操作"] --> B{"exec policy / approval 判定"}
     B -->|"放行"| C["直接执行"]
     B -->|"拒绝"| D["直接拒绝"]
-    B -->|"需要审批"| E["Guardian 介入"]
-    E --> F["重建上下文：用户意图 + 最近操作"]
+    B -->|"需要审批"| E{"配置了 Guardian reviewer？"}
+    E -->|是| F["Guardian 自动审查"]
+    E -->|否| E2["交给用户审批"]
     F --> G["调用 guardian 模型"]
     G --> H{"guardian 判定"}
     H -->|allow| C
@@ -30,7 +31,7 @@ flowchart TD
     H -->|"超时/报错/格式错误"| I
 ```
 
-注意最后一条：**超时、报错、输出格式错误，一律 deny。** 这叫 fail closed——guardian 出问题时不会静默放行。宁可多问一次用户，不可漏过一次危险操作。
+注意最后一条：**超时、报错、输出格式错误，一律 deny。** 这叫 fail closed——guardian 出问题时不会静默放行。deny 的直接结果是拒绝操作，不是自动转成人工询问。
 
 ## Guardian 看到什么？
 
@@ -41,7 +42,7 @@ flowchart TD
 - 最近的非用户条目：最多 40 条
 - 待审批的具体操作
 
-然后它返回结构化 JSON：risk_level + outcome（allow/deny）+ rationale。不是自由文本——必须是严格的结构化输出，解析失败就当 deny 处理。
+然后它返回结构化 JSON。其中 `outcome`（allow/deny）是必填字段，`risk_level` 和 `rationale` 可选，还有 `user_authorization` 字段。解析器允许从外围文本中提取 JSON，但如果提取不到有效结果，就当 deny 处理。
 
 ## 熔断器：防止死循环
 
@@ -75,7 +76,7 @@ Guardian 处理的是灰色地带：**技术上允许，但需要判断是否合
 - Guardian 也是 LLM，会误判——可能错误地 allow 一个危险操作，或错误地 deny 一个安全操作
 - 慢网络下 90 秒超时意味着用户可能等很久
 
-但对比替代方案（每条命令都弹框让用户确认），guardian 把 20 次人工审批减少到 0-2 次。对于高频操作的 coding agent，这个差距决定了宽松 approval policy 是否可用。
+但对比替代方案（每条命令都弹框让用户确认），guardian 能自动处理大部分“安全但需要确认”的操作。对于高频操作的 coding agent，这个差距决定了宽松 approval policy 是否可用。
 
 ## 回到审批疲劳
 
