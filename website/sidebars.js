@@ -39,6 +39,11 @@ const sidebars = {
           id: 'qa/skill-mechanism',
           label: '04. skill 发现与调用',
         },
+        {
+          type: 'doc',
+          id: 'qa/subagent-system',
+          label: '05. subagent 生命周期',
+        },
       ],
     },
   ],

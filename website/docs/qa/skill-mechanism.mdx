@@ -11,8 +11,6 @@ sidebar_label: 04. skill 发现与调用
   </blockquote>
 </section>
 
-> 源码快照：本章源码判断基于 `openai/codex@0fb559f0f6` 核对；路径均为仓库相对路径。
-
 ## 先回答
 
 Codex 的 skill 机制不是“启动时把所有 `SKILL.md` 全量塞进 prompt”，也不是“每次 query 都由 core 自动搜索最相关 skill”。更准确的模型是：
@@ -480,3 +478,7 @@ fn spawn_event_loop(...) {
 - skill 文件变化可被本地 app-server watcher 感知并清 cache，但当前 active turn 的 snapshot 不会自动变成新版本。
 
 这个设计的核心不是“让 skill 尽可能自动”，而是**在可发现性和上下文污染之间取平衡**：模型必须知道有哪些专门能力，但只有当前任务真的需要时，才把具体 skill 的完整指令带进来。
+
+---
+
+> 源码快照：本章源码判断基于 `openai/codex@0fb559f0f6` 核对；路径均为仓库相对路径。

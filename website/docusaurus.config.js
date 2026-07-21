@@ -92,8 +92,8 @@ const config = {
         },
         items: [
           {
-            href: 'https://github.com/openai/codex',
-            label: 'Codex',
+            href: 'https://github.com/luochang212/codex-notebook',
+            label: 'Codex Notebook',
             position: 'right',
           },
         ],

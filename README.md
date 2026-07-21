@@ -1,5 +1,7 @@
 # Codex Notebook
 
+> 我提问，你研究本地的 codex 仓库代码，然后把回答变成 ebook 中的一章
+
 Codex Notebook 是一个使用 Docusaurus 搭建的 Codex 架构问答笔记站点，框架结构参考 `luochang212/DL-Demos`：
 
 - 研究对象：`openai/codex`

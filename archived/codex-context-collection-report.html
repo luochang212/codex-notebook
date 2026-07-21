@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="基于 openai/codex 源码分析 Codex 如何收集、累积和筛选每次 query 的上下文。" />
+  <title>Codex 如何为一次 Query 组织上下文？</title>
+  <style>
+    :root {
+      --paper: #eef3f8;
+      --surface: #f8fbfe;
+      --ink: #102a43;
+      --muted: #526b80;
+      --line: #c8d6e2;
+      --blue: #155eef;
+      --blue-soft: #dce9ff;
+      --cyan: #007f92;
+      --cyan-soft: #d9f1f4;
+      --amber: #a24b00;
+      --amber-soft: #fff0d7;
+      --violet: #6840b8;
+      --violet-soft: #ece3ff;
+      --white: #ffffff;
+      --shadow: 0 18px 48px rgba(16, 42, 67, 0.10);
+      --radius: 18px;
+      --display: "Songti SC", "STSong", "Noto Serif CJK SC", serif;
+      --body: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(21, 94, 239, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(21, 94, 239, 0.035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 32px 32px;
+      font-family: var(--body);
+      line-height: 1.72;
+      text-rendering: optimizeLegibility;
+    }
+
+    a { color: var(--blue); text-underline-offset: 3px; }
+    a:focus-visible, button:focus-visible { outline: 3px solid #ffb24a; outline-offset: 3px; }
+    code { font-family: var(--mono); }
+
+    .topline {
+      height: 5px;
+      background: linear-gradient(90deg, var(--blue) 0 48%, var(--cyan) 48% 73%, #ff9f1c 73% 100%);
+    }
+
+    .shell {
+      width: min(1240px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 72px 0 54px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
+      gap: 64px;
+      align-items: center;
+    }
+
+    .eyebrow, .kicker {
+      margin: 0 0 14px;
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { margin-top: 0; text-wrap: balance; }
+    h1 {
+      max-width: 760px;
+      margin-bottom: 24px;
+      font-family: var(--display);
+      font-size: clamp(46px, 6vw, 82px);
+      font-weight: 700;
+      line-height: 1.04;
+      letter-spacing: -.04em;
+    }
+    h1 em { color: var(--blue); font-style: normal; }
+    .lede {
+      max-width: 730px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(18px, 2vw, 22px);
+      line-height: 1.65;
+    }
+
+    .snapshot {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      margin-top: 28px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .snapshot span { display: inline-flex; gap: 8px; align-items: center; }
+    .snapshot span::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--cyan);
+      content: "";
+    }
+
+    .context-machine {
+      position: relative;
+      padding: 26px;
+      border: 1px solid #aebfd0;
+      border-radius: 28px;
+      background: rgba(248, 251, 254, .88);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .context-machine::after {
+      position: absolute;
+      right: -90px;
+      bottom: -110px;
+      width: 260px;
+      height: 260px;
+      border: 48px solid rgba(21, 94, 239, .07);
+      border-radius: 50%;
+      content: "";
+    }
+    .machine-head {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 22px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .1em;
+    }
+    .signal { display: inline-flex; align-items: center; gap: 7px; }
+    .signal::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #16a36a;
+      box-shadow: 0 0 0 5px rgba(22, 163, 106, .12);
+      content: "";
+    }
+    .rail {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      gap: 10px;
+    }
+    .rail-item {
+      display: grid;
+      grid-template-columns: 70px 1fr auto;
+      gap: 14px;
+      align-items: center;
+      min-height: 58px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--white);
+    }
+    .rail-item strong { font-size: 14px; }
+    .rail-item small { color: var(--muted); font-size: 11px; }
+    .rail-code { color: var(--blue); font-family: var(--mono); font-size: 11px; }
+    .rail-arrow { text-align: center; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .rail-item.hot { border-color: #81aaff; background: var(--blue-soft); }
+    .rail-item.diff { border-color: #91cbd3; background: var(--cyan-soft); }
+    .rail-item.compact { border-color: #e8bd7e; background: var(--amber-soft); }
+
+    .verdict-wrap { padding-bottom: 56px; }
+    .verdict {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 28px;
+      padding: 34px 38px;
+      border-left: 6px solid var(--blue);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      background: var(--ink);
+      color: var(--white);
+      box-shadow: var(--shadow);
+    }
+    .verdict .label {
+      color: #9fc0ff;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .12em;
+    }
+    .verdict p { margin: 0; font-size: clamp(20px, 2.4vw, 29px); line-height: 1.5; }
+    .verdict strong { color: #b9d0ff; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr);
+      gap: 62px;
+      align-items: start;
+      padding: 40px 0 96px;
+    }
+    .toc {
+      position: sticky;
+      top: 26px;
+      padding: 20px 0;
+      border-top: 2px solid var(--ink);
+      border-bottom: 1px solid var(--line);
+    }
+    .toc-title {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .12em;
+    }
+    .toc a {
+      display: block;
+      padding: 7px 0;
+      color: var(--muted);
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .toc a:hover { color: var(--blue); }
+
+    main { min-width: 0; }
+    .section {
+      scroll-margin-top: 28px;
+      padding: 52px 0;
+      border-top: 1px solid var(--line);
+    }
+    .section:first-child { padding-top: 0; border-top: 0; }
+    .section h2 {
+      max-width: 790px;
+      margin-bottom: 22px;
+      font-family: var(--display);
+      font-size: clamp(31px, 4vw, 48px);
+      line-height: 1.15;
+      letter-spacing: -.025em;
+    }
+    .section h3 { margin: 34px 0 12px; font-size: 21px; line-height: 1.35; }
+    .section > p, .section > ul { max-width: 820px; }
+    .section p { margin: 0 0 18px; }
+    .section ul { padding-left: 1.25em; }
+    .section li { margin-bottom: 8px; }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin: 34px 0;
+    }
+    .stage {
+      position: relative;
+      min-height: 160px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+    .stage:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -19px;
+      width: 24px;
+      color: var(--blue);
+      background: var(--paper);
+      content: "→";
+      text-align: center;
+      transform: translateY(-50%);
+    }
+    .stage b { display: block; margin-bottom: 20px; color: var(--blue); font-family: var(--mono); font-size: 11px; }
+    .stage strong { display: block; margin-bottom: 8px; font-size: 16px; }
+    .stage p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+
+    .code-evidence {
+      margin: 30px 0;
+      border: 1px solid #9fb4c8;
+      border-radius: 16px;
+      background: #0b2239;
+      color: #dcecff;
+      overflow: hidden;
+    }
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 12px 18px;
+      border-bottom: 1px solid #24445f;
+      color: #9fb9ce;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    pre {
+      margin: 0;
+      padding: 20px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .kw { color: #95c1ff; }
+    .fn { color: #79e0d0; }
+    .cm { color: #7f9aad; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin: 30px 0;
+    }
+    .card {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(248, 251, 254, .82);
+    }
+    .card .tag {
+      display: inline-block;
+      margin-bottom: 16px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+    }
+    .card h3 { margin: 0 0 10px; }
+    .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    .card.cyan .tag { background: var(--cyan-soft); color: var(--cyan); }
+    .card.amber .tag { background: var(--amber-soft); color: var(--amber); }
+    .card.violet .tag { background: var(--violet-soft); color: var(--violet); }
+
+    .window-visual {
+      margin: 34px 0;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .window-row { display: grid; grid-template-columns: 150px 1fr; gap: 20px; align-items: center; margin: 14px 0; }
+    .window-row > span { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .blocks { display: flex; min-height: 42px; overflow: hidden; border-radius: 9px; }
+    .block { display: grid; place-items: center; padding: 8px; color: var(--ink); font-size: 11px; text-align: center; }
+    .b-history { flex: 5; background: #c7d4df; }
+    .b-runtime { flex: 2; background: var(--cyan-soft); }
+    .b-query { flex: 1.5; background: var(--blue-soft); color: #0a47bd; font-weight: 700; }
+    .b-recent { flex: 3; background: var(--blue-soft); }
+    .b-summary { flex: 4; background: var(--amber-soft); color: var(--amber); }
+    .b-context { flex: 2; background: var(--cyan-soft); }
+
+    .matrix {
+      width: 100%;
+      margin: 30px 0;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 14px;
+    }
+    .matrix th, .matrix td { padding: 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .matrix th { background: #dfe8f0; font-size: 12px; }
+    .matrix th:first-child { border-top-left-radius: 12px; }
+    .matrix th:last-child { border-top-right-radius: 12px; }
+    .matrix th:first-child, .matrix td:first-child { border-left: 1px solid var(--line); }
+    .matrix tr:first-child th { border-top: 1px solid var(--line); }
+    .matrix tr:last-child td:first-child { border-bottom-left-radius: 12px; }
+    .matrix tr:last-child td:last-child { border-bottom-right-radius: 12px; }
+
+    .warning {
+      margin: 30px 0;
+      padding: 24px 26px;
+      border: 1px solid #e5b368;
+      border-radius: 14px;
+      background: var(--amber-soft);
+    }
+    .warning strong { color: var(--amber); }
+
+    .answer {
+      padding: 38px;
+      border: 1px solid #8fb0ed;
+      border-radius: 22px;
+      background: linear-gradient(145deg, #eaf2ff, #f7fbff 70%);
+    }
+    .answer p { margin: 0; font-family: var(--display); font-size: clamp(22px, 2.7vw, 34px); line-height: 1.55; }
+
+    .sources { display: grid; gap: 10px; padding: 0; list-style: none; }
+    .sources li {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 16px;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .sources code { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .sources span { font-size: 14px; }
+
+    footer {
+      padding: 32px 0 48px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    @media (max-width: 980px) {
+      .hero { grid-template-columns: 1fr; gap: 38px; }
+      .context-machine { max-width: 680px; }
+      .layout { grid-template-columns: 1fr; }
+      .toc { position: static; display: flex; flex-wrap: wrap; gap: 2px 18px; }
+      .toc-title { width: 100%; }
+      .pipeline { grid-template-columns: repeat(2, 1fr); }
+      .stage:nth-child(2)::after { display: none; }
+    }
+
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 24px, 1240px); }
+      .hero { padding-top: 44px; }
+      h1 { font-size: 43px; }
+      .verdict { grid-template-columns: 1fr; padding: 26px; gap: 12px; }
+      .layout { padding-top: 22px; gap: 30px; }
+      .section { padding: 40px 0; }
+      .pipeline, .cards { grid-template-columns: 1fr; }
+      .stage { min-height: auto; }
+      .stage:not(:last-child)::after { display: none; }
+      .rail-item { grid-template-columns: 58px 1fr; }
+      .rail-item small { display: none; }
+      .window-row { grid-template-columns: 1fr; gap: 6px; }
+      .blocks { flex-direction: column; }
+      .block { min-height: 42px; }
+      .matrix { display: block; overflow-x: auto; white-space: nowrap; }
+      .sources li { grid-template-columns: 1fr; gap: 4px; }
+      .answer { padding: 26px; }
+    }
+
+    @media print {
+      body { background: white; }
+      .shell { width: 100%; }
+      .hero { padding-top: 30px; }
+      .toc { display: none; }
+      .layout { display: block; }
+      .section { break-inside: avoid; }
+      .context-machine, .verdict, .card, .code-evidence { box-shadow: none; }
+      a { color: inherit; text-decoration: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="topline"></div>
+  <header class="shell hero">
+    <div>
+      <p class="eyebrow">Codex architecture note / 2026-07-21</p>
+      <h1>Codex 如何为一次 <em>Query</em> 组织上下文？</h1>
+      <p class="lede">它不是先从旧对话里检索“最相关片段”，而是维护连续会话历史，再叠加运行时状态差量、显式能力注入与按需工具结果；窗口吃紧时，才用有损摘要接力。</p>
+      <div class="snapshot">
+        <span>openai/codex</span>
+        <span>commit 841e47b8fb</span>
+        <span>source verified</span>
+      </div>
+    </div>
+
+    <aside class="context-machine" aria-label="Codex 上下文构成示意图">
+      <div class="machine-head"><span>CONTEXT RAIL</span><span class="signal">SAMPLING READY</span></div>
+      <div class="rail">
+        <div class="rail-item"><span class="rail-code">BASE</span><strong>基础指令</strong><small>stable prefix</small></div>
+        <div class="rail-arrow">↓ ordered append</div>
+        <div class="rail-item"><span class="rail-code">HIST</span><strong>连续会话历史</strong><small>user · assistant · tools</small></div>
+        <div class="rail-arrow">＋ state delta</div>
+        <div class="rail-item diff"><span class="rail-code">DIFF</span><strong>当前运行时状态</strong><small>cwd · AGENTS.md · permissions</small></div>
+        <div class="rail-arrow">＋ turn-specific</div>
+        <div class="rail-item hot"><span class="rail-code">QUERY</span><strong>本轮输入与能力注入</strong><small>mentions · hooks · extensions</small></div>
+        <div class="rail-arrow">↓ when token limit reached</div>
+        <div class="rail-item compact"><span class="rail-code">ZIP</span><strong>Compaction 接力</strong><small>recent user + summary</small></div>
+      </div>
+    </aside>
+  </header>
+
+  <div class="shell verdict-wrap">
+    <div class="verdict">
+      <div class="label">CURRENT VERDICT</div>
+      <p>Codex Core 负责组织和约束上下文，<strong>不负责对全部历史做通用语义相关性排序</strong>。旧信息是否与当前 query 有关，主要由模型在读取上下文后判断。</p>
+    </div>
+  </div>
+
+  <div class="shell layout">
+    <nav class="toc" aria-label="报告目录">
+      <div class="toc-title">REPORT MAP</div>
+      <a href="#request">一次请求</a>
+      <a href="#continuity">是否连续</a>
+      <a href="#delta">状态差量</a>
+      <a href="#compaction">压缩接力</a>
+      <a href="#relevance">相关性边界</a>
+      <a href="#memory">长期记忆</a>
+      <a href="#model">心智模型</a>
+      <a href="#sources">源码索引</a>
+    </nav>
+
+    <main>
+      <section class="section" id="request">
+        <p class="kicker">Request lifecycle</p>
+        <h2>一次 query 不是单独发送，而是被放回整个活动上下文</h2>
+        <p><code>run_turn</code> 是正常 turn 的主入口。它先判断是否需要压缩，再捕获本轮可见的运行状态，处理 skill、plugin、hook 和用户输入。真正准备模型输入时，它复制当前历史并调用 <code>for_prompt</code>。</p>
+
+        <div class="pipeline" aria-label="请求处理四阶段">
+          <div class="stage"><b>01 / CHECK</b><strong>检查窗口预算</strong><p>达到阈值时，先执行 pre-turn compaction。</p></div>
+          <div class="stage"><b>02 / CAPTURE</b><strong>捕获当前状态</strong><p>固定本次请求所见的环境、工具和执行配置。</p></div>
+          <div class="stage"><b>03 / RECORD</b><strong>追加本轮内容</strong><p>记录用户输入、hook 上下文和显式能力注入。</p></div>
+          <div class="stage"><b>04 / SAMPLE</b><strong>整理完整历史</strong><p>规范化活动 history 后，将其交给模型。</p></div>
+        </div>
+
+        <div class="code-evidence">
+          <div class="code-head"><span>codex-rs/core/src/session/turn.rs::run_turn</span><span>关键证据</span></div>
+          <pre><span class="cm">// Construct the input that we will send to the model.</span>
+<span class="kw">let</span> sampling_request_input = sess
+    .<span class="fn">clone_history</span>()
+    .await
+    .<span class="fn">for_prompt</span>(&amp;turn_context.model_info.input_modalities);</pre>
+        </div>
+
+        <p>注意这里没有传入当前 query，也没有出现 <code>search_relevant_history(query)</code> 一类调用。概念上，模型收到的是当前活动历史，而不是 Core 根据 query 预选出的 top-k 对话片段。</p>
+      </section>
+
+      <section class="section" id="continuity">
+        <p class="kicker">Continuity</p>
+        <h2>窗口内连续，但不是无限、逐字、无损</h2>
+        <p><code>ContextManager</code> 使用按时间顺序排列的 <code>Vec&lt;ResponseItem&gt;</code> 保存 thread transcript。用户消息、assistant 回复、reasoning、工具调用和工具输出都会进入这个序列。</p>
+
+        <div class="cards">
+          <article class="card">
+            <span class="tag">CONTINUOUS</span>
+            <h3>顺序追加</h3>
+            <p>旧 item 在前，新 item 在后。同一 turn 内的工具输出写回历史后，会参与下一次 sampling。</p>
+          </article>
+          <article class="card amber">
+            <span class="tag">LOSSY EDGES</span>
+            <h3>存在有损边界</h3>
+            <p>工具输出可能被截断；不支持的媒体会被剥离；compaction、rollback 和新窗口会改写历史。</p>
+          </article>
+        </div>
+
+        <p><code>for_prompt</code> 主要负责规范化：补齐工具调用/输出配对、删除孤立输出，并根据模型支持的输入模态剥离图片或音频。它不是语义过滤器。</p>
+      </section>
+
+      <section class="section" id="delta">
+        <p class="kicker">Baseline + diff</p>
+        <h2>对话文本靠追加，运行时状态靠基线与差量</h2>
+        <p>Codex 不会每轮都重复塞入完整环境。它将 cwd、workspace roots、权限、日期时区、协作模式、<code>AGENTS.md</code>、apps 与 plugins 等组织为 <code>WorldState</code>。</p>
+
+        <div class="code-evidence">
+          <div class="code-head"><span>codex-rs/core/src/session/mod.rs</span><span>full vs diff</span></div>
+          <pre><span class="kw">let</span> should_inject_full_context = reference_context_item.<span class="fn">is_none</span>();
+
+<span class="kw">if</span> should_inject_full_context {
+    <span class="cm">// 没有可信基线：完整注入</span>
+    build_initial_context_with_world_state_and_mcp(...)
+} <span class="kw">else</span> {
+    <span class="cm">// 稳态：只追加 settings 与 world-state 的变化</span>
+    history.<span class="fn">update_world_state</span>(world_state)
+}</pre>
+        </div>
+
+        <p>这里解决的是重复和状态一致性，不是语义相关性。如果 baseline 消失，系统会重新全量注入，避免在缺少前态时继续做 diff，导致模型看到不完整状态。</p>
+
+        <div class="warning"><strong>关键区别：</strong>状态 diff 回答“什么发生了变化”；它不回答“什么与当前问题语义最相关”。</div>
+      </section>
+
+      <section class="section" id="compaction">
+        <p class="kicker">Context checkpoint</p>
+        <h2>上下文过长时，连续历史会被压缩为一份任务交接</h2>
+        <p>达到自动压缩阈值或模型完整上下文窗口时，Codex 让模型生成 handoff summary，要求保留进展、关键决策、约束、用户偏好、剩余工作和必要引用。压缩完成后，它会替换活动历史，而不是简单在原历史末尾追加摘要。</p>
+
+        <div class="window-visual" aria-label="压缩前后窗口对比">
+          <div class="window-row">
+            <span>BEFORE</span>
+            <div class="blocks"><div class="block b-history">旧对话与工具过程</div><div class="block b-runtime">状态更新</div><div class="block b-query">当前 query</div></div>
+          </div>
+          <div class="window-row">
+            <span>AFTER COMPACTION</span>
+            <div class="blocks"><div class="block b-recent">最近用户原话</div><div class="block b-summary">语义摘要</div><div class="block b-context">当前上下文</div></div>
+          </div>
+        </div>
+
+        <p>本地 compaction 会从新到旧选择真实用户消息，合计最多约 20,000 token，再追加摘要。必要时，当前 initial context 会被重新插入到最后一个真实用户消息之前。</p>
+        <p>因此压缩后的连续性是“语义接力”，不是逐项回放。多次压缩可能累积遗漏和误差，源码也明确提醒长 thread 与多次 compaction 会降低准确性。</p>
+      </section>
+
+      <section class="section" id="relevance">
+        <p class="kicker">Relevance boundaries</p>
+        <h2>“相关”在 Codex 中有四种不同含义</h2>
+
+        <table class="matrix">
+          <thead><tr><th>上下文类型</th><th>如何进入请求</th><th>谁判断相关性</th></tr></thead>
+          <tbody>
+            <tr><td>旧对话</td><td>活动窗口内按顺序整体保留</td><td>主要由模型根据当前 query 判断</td></tr>
+            <tr><td>运行时状态</td><td>按当前 cwd、环境与配置确定作用域，再做 diff</td><td>确定性作用域规则，不做语义打分</td></tr>
+            <tr><td>Skill / plugin / app</td><td>检查当前用户输入中的显式 mention，并注入对应指导</td><td>结构化路由与显式触发规则</td></tr>
+            <tr><td>仓库与外部材料</td><td>模型调用搜索、文件、Git、MCP 等工具后写回 history</td><td>模型决定搜什么、读什么</td></tr>
+          </tbody>
+        </table>
+
+        <h3>历史消息：没有默认的 top-k 语义检索</h3>
+        <p>如果早期讨论任务 A，之后转向无关的任务 B，A 仍会留在活动窗口中。Core 不会因为它和 B 不相似就立即删除它。最可靠的隔离方式仍然是为独立任务创建新 thread。</p>
+
+        <h3>能力注入：少数真正检查当前 query 的路径</h3>
+        <p><code>build_skills_and_plugins</code> 只从当前 <code>TurnInput::UserInput</code> 收集内容，用于识别显式 skill、plugin 和 app mention。它是规则驱动的 turn-specific routing，但并不是对全部会话历史做通用语义检索。</p>
+
+        <h3>代码材料：相关性形成于工具闭环</h3>
+        <p>Codex 不会在每次 query 前自动扫描整个仓库。模型先看到 query、历史、运行环境和工具定义，再决定搜索与读取哪些内容。工具结果进入 history，模型据此继续推理。</p>
+      </section>
+
+      <section class="section" id="memory">
+        <p class="kicker">Optional memory layer</p>
+        <h2>长期 memory 是另一层，不等于当前 thread history</h2>
+        <p>启用 <code>MemoryTool</code> 且配置允许时，memories extension 会把 <code>memory_summary.md</code> 作为 developer context 注入，并提供进一步读取或搜索 memory 的工具。</p>
+        <p>这仍不是“每轮自动对所有长期记忆做 embedding top-k”：摘要是预先整理的高密度入口，更详细内容需要模型按需使用工具取得。该层面向跨 thread 经验，而 <code>ContextManager</code> 维护的是当前 thread 的活动上下文。</p>
+      </section>
+
+      <section class="section" id="model">
+        <p class="kicker">Working mental model</p>
+        <h2>把 Codex 上下文理解为四层叠加</h2>
+
+        <div class="cards">
+          <article class="card"><span class="tag">LAYER 1</span><h3>基础指令</h3><p>模型、开发者和协作模式指令，构成相对稳定的约束前缀。</p></article>
+          <article class="card cyan"><span class="tag">LAYER 2</span><h3>连续历史</h3><p>用户、assistant、reasoning 和工具事件，按时间顺序追加。</p></article>
+          <article class="card violet"><span class="tag">LAYER 3</span><h3>运行时状态</h3><p>首轮全量，后续差量；按执行作用域确定，而非语义相似度。</p></article>
+          <article class="card amber"><span class="tag">LAYER 4</span><h3>按需材料</h3><p>文件、Git、网页、MCP 与 memory，通过工具调用进入历史。</p></article>
+        </div>
+
+        <div class="answer">
+          <p>Codex 的上下文在活动窗口内基本连续累积，但不会在每轮开始时智能删除所有“与当前 query 无关”的旧消息。它用作用域规则、显式 mention、状态 diff、按需工具和 compaction 控制上下文；真正的语义相关性判断主要留给模型。</p>
+        </div>
+      </section>
+
+      <section class="section" id="sources">
+        <p class="kicker">Source index</p>
+        <h2>关键源码位置</h2>
+        <ul class="sources">
+          <li><span>Turn 主循环</span><code>codex-rs/core/src/session/turn.rs::run_turn</code></li>
+          <li><span>历史容器</span><code>codex-rs/core/src/context_manager/history.rs::ContextManager</code></li>
+          <li><span>全量与差量注入</span><code>codex-rs/core/src/session/mod.rs::record_context_updates_and_set_reference_context_item</code></li>
+          <li><span>World state 构造</span><code>codex-rs/core/src/session/world_state.rs::build_world_state_for_step</code></li>
+          <li><span>状态 diff</span><code>codex-rs/core/src/context/world_state/mod.rs::render_history_diff</code></li>
+          <li><span>压缩替换</span><code>codex-rs/core/src/compact.rs::run_compact_task_inner_impl</code></li>
+          <li><span>摘要提示</span><code>codex-rs/prompts/templates/compact/prompt.md</code></li>
+          <li><span>长期记忆扩展</span><code>codex-rs/ext/memories/src/extension.rs</code></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="shell">CODEX NOTEBOOK · SOURCE-BASED ARCHITECTURE REPORT · GENERATED FROM LOCAL REPOSITORY SNAPSHOT</div>
+  </footer>
+</body>
+</html>
