@@ -1,0 +1,75 @@
+---
+id: ch09-guardian
+title: 沙箱管不了的事，谁来管？
+sidebar_label: 9. Guardian 审批机制
+---
+
+## 设计问题
+
+沙箱限制了进程能碰什么资源，但有些决策不是"能不能做"而是"该不该做"。比如模型要 apply 一个 patch——沙箱允许写文件，但这个 patch 的内容合理吗？这个判断谁来做？
+
+## 直觉答案 vs 实际选择
+
+直觉上，所有危险操作都弹框让用户确认。安全，但用户会被审批弹窗淹没。
+
+Codex 的实际选择是：**用一个专门的 guardian 模型做自动审批。** guardian 是一个独立的 review session，它看到操作的上下文（用户意图 + 最近的操作历史），判断"这个操作是否符合用户意图"。只有 guardian 不确定或拒绝时，才升级给用户。
+
+## Guardian 的工作流程
+
+```rust
+// codex-rs/core/src/guardian/mod.rs:1-12
+//! 1. Reconstruct a compact transcript that preserves user intent plus the most
+//!    relevant recent assistant and tool context.
+//! 2. Ask a dedicated guardian review session to assess the exact planned
+//!    action and return strict JSON.
+//! 3. Fail closed on timeout, execution failure, or malformed output.
+//! 4. Apply the guardian's explicit allow/deny outcome.
+```
+
+四步：
+
+1. **重建上下文**：从对话历史中提取用户意图 + 最近 40 条相关消息/工具调用（截断到 ~10000 token）
+2. **调用 guardian 模型**：把上下文 + 待审批操作发给 guardian，要求返回结构化 JSON（allow/deny + 理由）
+3. **失败即拒绝**：超时（90s）、模型报错、输出格式错误 → 一律 deny（fail closed）
+4. **执行决策**：allow → 自动放行；deny → 拒绝或升级给用户
+
+## 熔断器：防止 guardian 陷入死循环
+
+```rust
+// codex-rs/core/src/guardian/mod.rs:47
+pub(crate) const MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN: u32 = 3;
+```
+
+如果 guardian 连续拒绝 3 次同一个 turn 的操作，熔断器触发——不再自动审批，直接升级给用户。这防止了"模型反复尝试同一个操作，guardian 反复拒绝"的死循环。
+
+## Guardian 不是万能的
+
+Guardian 只处理 `on-request` 审批——即 exec policy 标记为"需要审批"的操作。它不处理：
+
+- 已经被 exec policy 白名单放行的命令
+- 已经被沙箱阻止的操作（根本到不了 guardian）
+- 文件写入（apply_patch 默认不需要审批，除非配置了更严格的策略）
+
+## 取舍
+
+**得到什么**：
+
+- 用户不被审批弹窗淹没——大部分"安全但需要确认"的操作由 guardian 自动处理
+- fail closed 保证安全——guardian 出问题时不会静默放行
+- 熔断器防止死循环——不会无限消耗 token 在审批上
+
+**放弃什么**：
+
+- guardian 本身消耗 token——每次审批都是一次模型调用
+- guardian 可能误判——它也是一个 LLM，可能错误地 allow 或 deny
+- 90s 超时意味着慢网络下用户要等很久
+
+## 对读者的启示
+
+如果你的 agent 系统面向开发者（他们能看懂命令、能判断风险），可以不用 guardian，直接弹框让用户确认。但如果面向非技术用户，或者操作频率很高（一个 turn 可能执行 20 条命令），自动审批就是必须的。
+
+核心洞察：**审批的本质是"这个操作是否符合用户意图"，而不是"这个操作是否危险"。** 危险操作由沙箱和 exec policy 硬拦截。guardian 处理的是"技术上允许，但需要判断是否合理"的灰色地带。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/guardian/mod.rs`、`guardian/review.rs`、`guardian/approval_request.rs`）

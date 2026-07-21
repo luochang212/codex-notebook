@@ -1,0 +1,146 @@
+---
+id: ch10-agent-roles
+title: 为什么需要多种"角色"而不是统一的一种 agent？
+sidebar_label: 10. 角色与 Spawn
+---
+
+## 设计问题
+
+一个 coding agent 遇到复杂任务时，需要把子任务分给多个子 agent。问题是：这些子 agent 应该是"同一种东西的不同实例"，还是"不同种类的东西"？如果是不同种类，"种类"由什么定义？
+
+## 直觉答案 vs 实际选择
+
+直觉上，不同角色应该有不同能力——explorer 只能读代码不能写，worker 能写代码但不能做架构决策。像微服务一样，每个角色有独立的权限边界。
+
+Codex 的实际选择出人意料地轻量：**角色只是一段写给父 agent 看的 description 文本，加上可选的配置覆盖。** 它不是子 agent 的行为约束，而是父 agent 的"使用说明书"。
+
+## 角色的本质：spawn tool 的 description
+
+```rust
+// codex-rs/core/src/agent/role.rs:230-258
+pub(crate) mod spawn_tool_spec {
+    pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
+        let built_in_roles = built_in::configs();
+        build_from_configs(built_in_roles, user_defined_agent_roles)
+    }
+
+    fn build_from_configs(
+        built_in_roles: &BTreeMap<String, AgentRoleConfig>,
+        user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
+    ) -> String {
+        let mut seen = BTreeSet::new();
+        let mut formatted_roles = Vec::new();
+        for (name, declaration) in user_defined_roles {
+            if seen.insert(name.as_str()) {
+                formatted_roles.push(format_role(name, declaration));
+            }
+        }
+        for (name, declaration) in built_in_roles {
+            if seen.insert(name.as_str()) {
+                formatted_roles.push(format_role(name, declaration));
+            }
+        }
+        format!("Available roles:\n{}", formatted_roles.join("\n"))
+    }
+}
+```
+
+这段代码的读者不是子 agent，而是**父 agent**。`spawn_tool_spec::build` 把所有角色的 name + description 拼成一段文本，塞进父 agent 的 spawn tool 的 description 里。父 agent 看到这段文本后，决定"我应该用哪个角色来 spawn 子 agent"。
+
+子 agent 本身完全不知道自己的"角色"是什么。它的行为由 config（模型、工具、权限）决定，不由 description 决定。
+
+## 内建角色：三个配置预设
+
+| 角色 | description 要点 | config_file | 实际效果 |
+|------|-----------------|-------------|----------|
+| `default` | "Default agent." | 无 | 继承父 agent 配置 |
+| `explorer` | 用于代码库问题，快速、权威，鼓励并行 spawn | `explorer.toml`（空文件） | 和 default 完全相同 |
+| `worker` | 用于执行和生产工作，强调文件所有权、不要 revert 别人的修改 | 无 | 和 default 完全相同 |
+
+```rust
+// codex-rs/core/src/agent/role.rs:315-377（built_in 模块，节选）
+(
+    "explorer".to_string(),
+    AgentRoleConfig {
+        description: Some(r#"Use `explorer` for specific codebase questions.
+Explorers are fast and authoritative.
+They must be used to ask specific, well-scoped questions on the codebase.
+Rules:
+- In order to avoid redundant work, you should avoid exploring the same
+  problem that explorers have already covered...
+- You are encouraged to spawn up multiple explorers in parallel..."#.to_string()),
+        config_file: Some("explorer.toml".parse().unwrap_or_default()),
+        nickname_candidates: None,
+    }
+),
+```
+
+注意 `explorer.toml` 是一个**空文件**。这意味着 explorer 和 default 在配置层面完全相同——相同的模型、相同的工具、相同的权限。唯一的区别是父 agent 看到的 description 不同，导致它以不同方式使用 spawn 工具。
+
+## Spawn 的实际过程
+
+当父 agent 调用 spawn 工具时，系统做三件事：
+
+1. **应用角色配置**：`apply_role_to_config` 把角色的 config_file（如果有非空内容）作为高优先级层插入 config
+2. **创建新 Session**：子 agent 获得独立的 Session（独立的 conversation history、独立的 turn 循环）
+3. **注入初始输入**：父 agent 给的任务描述作为子 agent 的第一条 user message
+
+```rust
+// codex-rs/core/src/agent/role.rs:38-54
+pub(crate) async fn apply_role_to_config(
+    config: &mut Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role = resolve_role_config(config, role_name)
+        .cloned()
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+    apply_role_to_config_inner(config, role_name, &role).await.map_err(|err| {
+        tracing::warn!("failed to apply role to config: {err}");
+        AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+    })
+}
+```
+
+关键细节：`apply_role_to_config` 保留父 agent 的 model、model_provider、service_tier，除非角色的 config_file 显式覆盖。这防止了子 agent 因为角色切换而意外降级到默认模型。
+
+## 深度限制：防止无限递归
+
+```rust
+// codex-rs/core/src/agent/registry.rs:70-76
+pub(crate) fn next_thread_spawn_depth(session_source: &SessionSource) -> i32 {
+    session_depth(session_source).saturating_add(1)
+}
+
+pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bool {
+    depth > max_depth
+}
+```
+
+每个子 agent 的 SessionSource 记录了它的 spawn 深度。spawn 时检查深度是否超限。这是一个简单的递归保护——没有它，一个 agent 可以无限 spawn 子 agent，耗尽系统资源。
+
+## 取舍
+
+**得到什么**：
+
+- 极其轻量的角色系统——添加新角色只需一段 description + 可选的 toml 配置
+- 不引入新的运行时机制——角色不是新类型的 agent，只是配置预设
+- 父 agent 自主决策——系统不强制"什么时候该用什么角色"，由模型判断
+
+**放弃什么**：
+
+- 无法强制执行行为边界——description 说"explorer 只读不写"，但 explorer 实际上有写权限
+- 角色之间没有真正的能力差异——如果 config_file 为空，所有角色在运行时完全相同
+- 依赖模型遵守 description 中的"规则"——这些规则只是 prompt 文本，不是硬约束
+
+## 对读者的启示
+
+如果你的 agent 系统需要"不同类型的子 agent"，先问一个问题：这些"类型"之间的差异是**配置差异**（不同模型、不同工具集、不同权限）还是**行为差异**（不同的决策逻辑、不同的输出格式）？
+
+如果是配置差异，Codex 的角色系统（description + config overlay）就够了。如果是行为差异，你需要更重的机制——不同的 system prompt、不同的工具 handler、甚至不同的模型。
+
+核心洞察：**Codex 把"角色"定义为"给调度者看的使用说明"，而不是"给执行者看的行为约束"。** 这是一个极端轻量的设计——它假设模型能根据 description 正确使用 spawn 工具，而不需要系统层面的强制隔离。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/agent/role.rs`、`codex-rs/core/src/agent/control/spawn.rs`、`codex-rs/core/src/agent/registry.rs`）

@@ -1,0 +1,99 @@
+---
+id: ch07-tool-system
+title: 为什么不给 LLM 一个万能 bash 就够了？
+sidebar_label: 7. 工具系统设计
+---
+
+## 设计问题
+
+LLM 已经会写 shell 命令了。为什么还要设计一套结构化工具（apply_patch、read、write）？直接给它一个 bash 不就什么都能做了？
+
+## 直觉答案 vs 实际选择
+
+直觉上，一个万能 bash 工具就够了——模型想做什么就写什么命令。简单、灵活、无限制。
+
+Codex 的实际选择是：**结构化工具是主力，bash 是兜底。** 核心文件操作走 `apply_patch`（精确替换），不走 `echo > file`。搜索走专用工具，不走 `grep -r`。bash 仍然存在，但它是"其他工具做不了的事"的出口，不是默认路径。
+
+## 工具注册：spec + handler
+
+每个工具由两部分组成：
+
+- **ToolSpec**：JSON Schema 格式的参数定义 + description 文本（发给模型看的"使用手册"）
+- **Handler**：实际执行逻辑（Rust 代码）
+
+```rust
+// codex-rs/core/src/tools/handlers/mod.rs
+pub(crate) mod apply_patch;      // 精确文件修改
+mod shell;                        // bash 命令执行
+pub(crate) mod shell_spec;       // shell 的 spec 定义
+// ... 还有 read、write、web_search、multi_agents 等
+```
+
+`spec_plan.rs` 负责根据当前配置决定哪些工具对模型可见。不是所有工具在所有场景下都暴露——比如子 agent 工具只在多 agent 模式下出现。
+
+## apply_patch：为什么不能直接写文件
+
+`apply_patch` 是 Codex 最核心的工具。它不是"把内容写入文件"，而是"在文件中找到这段文本，替换成那段文本"：
+
+```
+*** Begin Patch
+*** Update File: src/main.rs
+@@
+-    let x = old_value;
++    let x = new_value;
+*** End Patch
+```
+
+为什么不用 `write_file`（全量覆写）？
+
+1. **精确性**：模型只需要输出变化的部分，不需要输出整个文件。一个 500 行的文件改 2 行，模型只输出 2 行 diff，不是 500 行全文。
+2. **安全性**：如果模型记错了文件内容（比如幻觉了一个不存在的函数），精确替换会失败（找不到 old text），而全量覆写会静默覆盖。
+3. **可审计**：patch 格式天然是一个 diff，用户和系统都能一眼看出改了什么。
+
+## shell：受控的万能出口
+
+shell 工具仍然存在，但它受到三层约束：
+
+1. **exec policy**：命令级白名单/黑名单（`ExecPolicyManager`）
+2. **sandbox**：进程级隔离（bubblewrap/seatbelt/landlock）
+3. **审批**：某些命令需要用户确认才能执行
+
+这意味着模型可以执行 `cargo build`，但不能执行 `rm -rf /`——不是靠模型"自觉"，而是靠系统强制。
+
+## 工具 spec 如何影响模型行为
+
+工具的 description 不是写给人看的文档——它是写给模型看的"行为指令"。比如 `apply_patch` 的 spec 里会写：
+
+- "每次只修改一个文件"
+- "必须先 read 文件确认当前内容，再 apply patch"
+- "不要猜测文件内容"
+
+这些约束不是运行时强制的——模型可以违反。但它们大幅降低了模型犯错的概率。这是"用 spec 引导行为"而非"用代码强制行为"的设计哲学。
+
+## 取舍
+
+**得到什么**：
+
+- 精确替换几乎消除了"写错文件"的可能
+- 结构化工具让审批和沙箱可以精确到操作级别
+- 工具 spec 是模型行为的"软约束"，不需要硬编码 if-else
+
+**放弃什么**：
+
+- 模型的选择负担增加——10 个工具比 1 个 bash 难选
+- 工具 spec 占 token——每个工具的 schema + description 都消耗 context window
+- 结构化工具限制了模型的表达方式——有些事用 bash 一行搞定，用结构化工具要好几步
+
+## 对读者的启示
+
+"给 LLM 什么工具"是一个安全-能力权衡。
+
+- 只给 bash：最大能力，最小安全
+- 只给结构化工具：最大安全，但模型可能做不了某些事
+- Codex 的选择：结构化工具为主 + bash 兜底 + 沙箱强制安全
+
+这个分层设计的关键洞察是：**安全不应该依赖模型的自觉，而应该由系统强制执行。** 工具 spec 引导模型"应该怎么做"，沙箱和 exec policy 强制模型"不能怎么做"。两层防线，缺一不可。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/tools/handlers/`、`tools/spec_plan.rs`、`apply_patch.rs`）

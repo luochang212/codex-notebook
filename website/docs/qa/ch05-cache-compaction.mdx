@@ -1,0 +1,140 @@
+---
+id: ch05-cache-compaction
+title: 聊了 200 轮，上下文装不下了怎么办？
+sidebar_label: 5. 缓存与压缩
+---
+
+## 设计问题
+
+用户和 agent 聊了 200 轮，context window 装不下了。系统应该怎么做？直接截断旧消息？还是压缩成摘要？压缩的时机是什么？压缩后 prompt cache 还能命中吗？
+
+## 直觉答案 vs 实际选择
+
+直觉上，快满了就截断最早的消息，简单粗暴。
+
+Codex 的实际选择是：**用模型自己做摘要压缩（compaction），压缩后重建 baseline，prompt cache 从新 baseline 重新开始命中。** 压缩不是截断——它是一次有损的"换窗"操作，旧历史被摘要替代，但关键信息（文件操作记录、用户意图）被保留。
+
+## 触发时机：token budget 超限
+
+```rust
+// codex-rs/core/src/session/context_window.rs
+pub(crate) struct ContextWindowTokenStatus {
+    pub(crate) auto_compact_scope_tokens: i64,
+    pub(crate) auto_compact_scope_limit: Option<i64>,
+    pub(crate) token_limit_reached: bool,
+    // ...
+}
+```
+
+每个 sampling step 结束后，turn 循环检查 `token_limit_reached`。如果超限：
+
+```rust
+// codex-rs/core/src/session/turn.rs:354
+if should_roll_over {
+    run_auto_compact(
+        &sess, step_context,
+        InitialContextInjection::BeforeLastUserMessage(world_state),
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+    ).await?;
+    continue;  // 压缩完继续循环
+}
+```
+
+压缩发生在 turn 中间（`MidTurn`），不中断用户交互。压缩完直接 `continue`，模型看到的是压缩后的历史。
+
+## 压缩做什么
+
+```rust
+// codex-rs/core/src/compact.rs:92
+pub(crate) async fn run_inline_auto_compact_task(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    initial_context_injection: InitialContextInjection,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+) -> CodexResult<()> {
+    let prompt = turn_context.config.compact_prompt
+        .as_deref()
+        .unwrap_or(SUMMARIZATION_PROMPT);
+    // 用模型对当前历史做摘要
+    run_compact_task_inner(sess, turn_context, input, ...).await
+}
+```
+
+压缩的核心是：把当前对话历史发给模型，让它生成一段摘要。然后用这段摘要**替换**整个历史，重新注入 initial context（base instructions + world state）。
+
+压缩后保留什么：
+- 摘要文本（模型生成的）
+- 文件操作记录（`readFiles`、`modifiedFiles`）
+- 最后一条用户消息（`BeforeLastUserMessage` 注入点）
+- 完整的 world state baseline
+
+丢弃什么：
+- 所有中间 tool call 和 tool result
+- 所有中间推理过程
+- 旧的 context diff 序列
+
+## 压缩与 prompt cache 的关系
+
+这是最精妙的部分。压缩前：
+
+```
+[base instructions] [world state] [diff1] [diff2] ... [user msg] [assistant] [tool call] ...
+|<——————————————— prompt cache 前缀 ————————————————>|
+```
+
+压缩后：
+
+```
+[base instructions] [world state（新 baseline）] [摘要] [最后用户消息]
+|<——————————— 新的 prompt cache 前缀 ———————————>|
+```
+
+压缩**重置了 baseline**。旧的 diff 序列全部丢弃，新的 baseline 包含压缩时刻的完整 world state。从下一次 sampling 开始，prompt cache 基于新前缀重新积累。
+
+这意味着压缩有一个隐性成本：压缩后的第一次请求一定 cache miss（因为前缀变了）。但后续请求会基于新前缀重新命中。
+
+## 两种压缩路径
+
+```rust
+// codex-rs/core/src/compact.rs:88
+pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
+    provider.supports_remote_compaction()
+}
+```
+
+- **本地压缩**（`run_inline_auto_compact_task`）：用当前模型做摘要，结果回注本地历史
+- **远程压缩**（`run_inline_remote_auto_compact_task`）：provider 支持时，压缩在服务端完成
+
+远程压缩的优势是不消耗本地 token budget（摘要请求不算在用户的 token 用量里）。
+
+## 取舍
+
+**得到什么**：
+
+- 对话可以无限延续——不会因为 context window 满了就中断
+- 摘要保留了语义信息——比简单截断好得多
+- 文件操作记录不丢——模型压缩后仍然知道改过哪些文件
+
+**放弃什么**：
+
+- 压缩是有损的——细节（具体的代码行号、中间推理步骤）会丢失
+- 压缩消耗一次模型调用——有延迟和成本
+- 压缩后 cache 重置——第一次请求一定 miss
+- 摘要质量取决于模型——如果模型摘要写得差，后续行为会偏
+
+## 对读者的启示
+
+如果你的 agent 系统面向短对话（< 20 轮），不需要 compaction。但如果是 coding agent（用户可能连续工作几小时），compaction 是必须的。
+
+核心设计决策是：**压缩后怎么处理 baseline？**
+
+- 如果不重置 baseline（只截断前面）：cache 前缀不变，但模型看到的上下文不连贯
+- 如果重置 baseline（Codex 的做法）：cache 重置一次，但模型看到的上下文是完整自洽的
+
+Codex 选了后者，因为对模型来说，"看到一段连贯的摘要"比"看到一段被截断的历史"更重要。cache miss 一次的成本远低于模型因为上下文不连贯而犯错的代价。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/compact.rs`、`compact_token_budget.rs`、`session/context_window.rs`、`session/turn.rs`）

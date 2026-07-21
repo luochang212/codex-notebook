@@ -1,0 +1,119 @@
+---
+id: ch02-model-call
+title: 模型调用失败了怎么办？
+sidebar_label: 2. 模型调用与流式响应
+---
+
+## 设计问题
+
+LLM 调用失败了——网络超时、服务端 500、WebSocket 断连——系统应该怎么响应？重试？降级？还是把错误交给模型自己处理？
+
+## 直觉答案 vs 实际选择
+
+直觉上，失败就重试，重试完还失败就报错给用户。简单直接。
+
+Codex 的实际选择更精细：**错误被分层处理——传输层自动重试和降级，业务层把错误编码进事件流，模型层让模型自己决定下一步。** 用户看到的不是"请求失败"，而是"Reconnecting... 2/5"这样的进度信息。
+
+## 两层客户端：Session 级和 Turn 级
+
+```rust
+// codex-rs/core/src/client.rs:253
+pub struct ModelClient {
+    state: Arc<ModelClientState>,
+    agent_identity_policy: AgentIdentityAuthPolicy,
+    http_client_factory: HttpClientFactory,
+    // Session 级：认证、provider 选择、传输配置
+}
+
+// codex-rs/core/src/client.rs:273
+pub struct ModelClientSession {
+    client: ModelClient,
+    websocket_session: WebsocketSession,
+    turn_state: Arc<OnceLock<String>>,  // sticky routing token
+    // Turn 级：WebSocket 连接复用、sticky routing
+}
+```
+
+`ModelClient` 活整个 Session 的生命周期，持有认证和 provider 配置。`ModelClientSession` 每个 Turn 创建一个，缓存 WebSocket 连接和 sticky routing token。
+
+为什么分两层？因为 sticky routing token 是 turn 级的契约——同一个 turn 内的多次请求（重试、增量追加）必须带同一个 token，但不同 turn 之间不能复用。如果 `ModelClientSession` 跨 turn 复用，就会把上一个 turn 的 token 泄漏到下一个 turn，违反客户端/服务端契约。
+
+## 重试与传输降级
+
+```rust
+// codex-rs/core/src/responses_retry.rs
+pub(crate) async fn handle_retryable_response_stream_error(
+    retries: &mut u64,
+    max_retries: u64,
+    err: CodexErr,
+    client_session: &mut ModelClientSession,
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Result<(), CodexErr> {
+    // 重试用完 → 尝试切换传输（WebSocket → HTTPS）
+    if *retries >= max_retries
+        && client_session.try_switch_fallback_transport(...) {
+        *retries = 0;  // 重置计数，用新传输继续
+        return Ok(());
+    }
+    // 还有重试次数 → 指数退避
+    if *retries < max_retries {
+        *retries += 1;
+        let delay = backoff(*retries);
+        sess.notify_stream_error(turn_context,
+            format!("Reconnecting... {}/{}", *retries, max_retries), err).await;
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
+    Err(err)  // 彻底失败
+}
+```
+
+三层防线：
+
+1. **同传输重试**：指数退避，最多 N 次
+2. **传输降级**：WebSocket 重试耗尽后切 HTTPS，重置计数器再来一轮
+3. **彻底失败**：返回错误，由 turn 循环决定是中断还是发错误事件
+
+关键设计：降级不是"放弃 WebSocket"，而是"重置重试预算，用另一种传输再试"。这意味着一次 turn 最多可以经历 2×N 次重试（N 次 WebSocket + N 次 HTTPS）。
+
+## 错误不是异常
+
+在 turn 循环里，模型调用的错误不会 panic 或 unwind——它被编码进事件流：
+
+```rust
+// codex-rs/core/src/session/turn.rs:450
+Err(e) => {
+    let error = e.to_codex_protocol_error();
+    sess.emit_turn_error_lifecycle(turn_context, error.clone()).await;
+    let event = EventMsg::Error(e.to_error_event(None));
+    sess.send_event(turn_context, event).await;
+    break;  // turn 结束，但 Session 不死
+}
+```
+
+错误变成 `EventMsg::Error`，通过 event channel 发给调用方。调用方（TUI、IDE）决定怎么展示。Session 本身继续活着，等下一条 `Op::UserInput`。
+
+## 取舍
+
+**得到什么**：
+
+- 用户不会看到"请求失败请重试"——系统自动处理瞬态故障
+- 传输降级对上层透明——turn 循环不知道底层是 WebSocket 还是 HTTPS
+- 错误不杀 Session——一次失败不丢整个对话历史
+
+**放弃什么**：
+
+- 重试逻辑增加了每次调用的延迟（指数退避意味着最坏情况下用户等很久）
+- 传输降级意味着同一个 turn 内可能混用两种传输，增加了调试复杂度
+- sticky routing token 的 turn 级约束意味着不能简单复用连接池
+
+## 对读者的启示
+
+如果你的 agent 系统只有一种传输（比如纯 HTTPS），重试逻辑可以很简单。但一旦引入 WebSocket（为了流式响应的低延迟），就必须设计降级路径。Codex 的做法是：把传输选择封装在 `ModelClientSession` 内部，上层只看到"流式事件"，不知道也不关心底层是什么传输。
+
+这个封装的代价是 `ModelClientSession` 变成了一个有状态的对象（缓存连接、缓存 token），不能随意创建和丢弃。但换来的是：turn 循环的代码完全不需要处理传输细节。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/client.rs`、`responses_retry.rs`、`session/turn.rs`）

@@ -1,0 +1,127 @@
+---
+id: ch14-config-layers
+title: 全局默认、项目规则、目录级指令，如何合并？
+sidebar_label: 14. 配置层与 AGENTS.md
+---
+
+## 设计问题
+
+一个企业用户：公司通过 MDM 推送了安全策略（禁止访问外网），用户自己配了偏好（用 vim 键位），项目有自己的规则（用 cargo 而不是 make），当前 session 有临时覆盖（这次用 debug 模式）。这些配置从哪来、谁优先、怎么合并？
+
+## 直觉答案 vs 实际选择
+
+直觉上，一个配置文件搞定一切。`~/.codex/config.toml` 里写所有设置，项目里放一个 `.codex/config.toml` 覆盖部分设置。两层够了。
+
+Codex 的实际选择是：**一套多层配置栈，每层有明确的优先级数值，高优先级覆盖低优先级。** 不是简单的"项目覆盖全局"，而是一个可以插入任意层数的有序栈。
+
+## 配置层的优先级
+
+```rust
+// codex-rs/config/src/config_layer_source.rs:31-48
+pub fn precedence(&self) -> i16 {
+    match self {
+        ConfigLayerSource::Mdm { .. } => 0,
+        ConfigLayerSource::System { .. } => 10,
+        ConfigLayerSource::EnterpriseManaged { .. } => 15,
+        ConfigLayerSource::User { profile, .. } => {
+            if profile.is_some() { 21 } else { 20 }
+        }
+        ConfigLayerSource::Project { .. } => 25,
+        ConfigLayerSource::SessionFlags => 30,
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. } => 40,
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => 50,
+    }
+}
+```
+
+从低到高：
+
+| 优先级 | 层 | 来源 | 典型内容 |
+|--------|-----|------|----------|
+| 0 | MDM | 企业设备管理推送 | 安全策略、网络限制 |
+| 10 | System | 系统级配置文件 | 管理员设置 |
+| 15 | EnterpriseManaged | 企业云 bundle | 组织级配置 |
+| 20/21 | User | `~/.codex/config.toml` + profile | 个人偏好 |
+| 25 | Project | `.codex/config.toml` | 项目规则 |
+| 30 | SessionFlags | CLI 参数、角色覆盖 | 临时覆盖 |
+| 40-50 | Legacy | 旧版 managed_config.toml | 向后兼容 |
+
+关键设计：优先级是**数值**，不是硬编码的层数。这意味着可以在任意两层之间插入新层，不需要重构整个系统。角色配置（ch10）就是以 `SessionFlags` 优先级插入的。
+
+## ConfigLayerStack：有序合并
+
+```rust
+// codex-rs/config/src/config_layer_source.rs:66-73
+pub struct ConfigLayer {
+    pub name: ConfigLayerSource,
+    pub version: String,
+    pub config: JsonValue,
+    pub disabled_reason: Option<String>,
+}
+```
+
+`ConfigLayerStack` 持有所有层的有序列表。`effective_config()` 从最低优先级开始，逐层 merge，高优先级覆盖低优先级的同名字段。被禁用的层（`disabled_reason` 非空）跳过。
+
+这不是"选一个文件"，而是"把所有文件的字段合并成一个有效配置"。一个字段可能来自 MDM，另一个来自用户配置，第三个来自项目配置——它们共存于同一个有效配置中。
+
+## AGENTS.md：项目指令的发现和拼接
+
+AGENTS.md 不是配置文件——它是写给模型看的项目指令。但它的发现机制和配置层类似：
+
+```rust
+// codex-rs/core/src/agents_md.rs:1-16（模块文档）
+//! 1. Determine the project root by walking upwards from the current working
+//!    directory until a configured `project_root_markers` entry is found.
+//!    When `project_root_markers` is unset, the default marker list is used
+//!    (`.git`).
+//! 2. Collect every `AGENTS.md` found from the project root down to the
+//!    current working directory (inclusive) and concatenate their contents
+//!    in that order.
+//! 3. We do **not** walk past the project root.
+```
+
+发现规则：
+
+1. 从 cwd 向上找 project root（默认标记是 `.git`）
+2. 从 project root 到 cwd 的每一级目录，收集所有 `AGENTS.md`
+3. 按从根到叶的顺序拼接
+
+这意味着 monorepo 里，根目录的 `AGENTS.md` 和子包的 `AGENTS.md` 会同时生效——根目录的规则在前，子包的规则在后。
+
+```rust
+// codex-rs/core/src/agents_md.rs:38-44
+pub const DEFAULT_AGENTS_MD_FILENAME: &str = "AGENTS.md";
+pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
+const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+```
+
+还有一个 `AGENTS.override.md`——本地覆盖文件，不提交到版本控制。它和 `AGENTS.md` 用分隔符拼接。
+
+## AGENTS.md 在上下文中的位置
+
+AGENTS.md 的内容被注入模型的 developer context。它不是 system prompt 的一部分，而是作为 `UserInstructions` 注入。在 WorldState 中，它也有自己的 section（`AgentsMdState`），参与 baseline/diff 机制——如果 AGENTS.md 在 turn 之间被修改，只有变化部分会被记录。
+
+## 取舍
+
+**得到什么**：
+
+- 企业可管控——MDM 层优先级最低但不可被用户覆盖（因为它是"要求"而非"偏好"）
+- 项目可定制——每个项目有自己的配置和指令，不影响全局
+- 临时可覆盖——session flags 优先级最高，调试时方便
+- 数值优先级可扩展——新增层不需要改已有逻辑
+
+**放弃什么**：
+
+- 心智负担——用户需要理解"我的配置为什么没生效"（可能被更高优先级层覆盖）
+- 调试困难——有效配置是多层合并的结果，不容易一眼看出某个字段的来源
+- AGENTS.md 拼接可能冲突——根目录和子目录的指令可能矛盾，系统不做冲突检测
+
+## 对读者的启示
+
+如果你的 agent 系统只面向个人用户，两层配置（全局 + 项目）就够了。但如果面向企业，你需要至少三层：组织策略（不可覆盖）、用户偏好、项目规则。
+
+核心洞察：**配置层的优先级数值不是"谁更重要"，而是"谁更具体"。** MDM 最通用（适用于所有设备），SessionFlags 最具体（只适用于这一次会话）。越具体的配置越应该覆盖越通用的配置——这是配置系统设计的通用原则。
+
+---
+
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/config/src/config_layer_source.rs`、`codex-rs/core/src/agents_md.rs`、`codex-rs/core/src/agents_md_manager.rs`）
