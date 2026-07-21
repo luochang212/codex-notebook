@@ -1,6 +1,8 @@
 # AGENTS.md
 
-本仓库是《Codex 的设计取舍：一个 Rust Coding Agent 的架构解剖》一书的写作空间。站点使用 Docusaurus，结构参考 `luochang212/DL-Demos` 的 `website/` 子项目。
+本仓库是《Codex 设计原理》一书的写作空间。站点使用 Docusaurus，结构参考 `luochang212/DL-Demos` 的 `website/` 子项目。
+
+在线阅读：https://luochang212.github.io/codex-notebook/
 
 全书以 `openai/codex` 代码库的**设计决策**为骨架，源码为佐证。除非用户明确要求扩展到其他项目或产品文档，否则所有架构判断都必须回到该代码库验证。
 
@@ -9,13 +11,14 @@
 ## 项目结构
 
 - `website/`：Docusaurus 站点源码。
-- `website/docs/intro.mdx`：首页。
-- `website/docs/qa/`：每个问答一个独立章节。
-- `website/src/components/ResearchQuestion.tsx`：问答章节的交互组件。
-- `website/src/components/ResearchQuestion.module.css`：问答组件样式。
+- `website/docs/intro.mdx`：序章。
+- `website/docs/ch{NN}-{slug}.mdx`：正文章节（ch01-ch15）。
 - `website/src/css/custom.css`：站点全局样式。
-- `website/sidebars.js`：侧边栏配置，也是问答导航的唯一手写来源；问答索引由 category `generated-index` 自动生成。
+- `website/sidebars.js`：侧边栏配置，按篇章（category）组织，是导航的唯一手写来源。
 - `website/docusaurus.config.js`：Docusaurus 配置。
+- `skills/`：写作辅助 skill。
+- `archived/`：历史审查报告，不参与构建。
+- `outline.md`：全书大纲。
 
 ## 开发命令
 
@@ -71,10 +74,10 @@ CODEX_SOURCE_DIR=
 每个章节放在：
 
 ```text
-website/docs/qa/ch{NN}-{slug}.mdx
+website/docs/ch{NN}-{slug}.mdx
 ```
 
-并在 `website/sidebars.js` 中加入对应条目。侧边栏按篇章（category）组织。
+并在 `website/sidebars.js` 中加入对应条目。侧边栏按篇章（category）组织，共七篇。
 
 新增或删除章节时，只维护 `website/sidebars.js`；不要维护手写章节清单。
 
@@ -141,10 +144,9 @@ Docusaurus 的 frontmatter `title` 会自动渲染页面顶部标题。不要在
 
 交互和设计必须服务理解，不要为了炫技增加信息噪声。
 
-- 每个问答章节可以使用交互组件，但交互组件不能遮蔽核心内容。
-- 卡片、标签页、折叠块要帮助读者区分“判断、机制、证据、追问”。
+- 章节以纯 MDX 为主，直接使用 Markdown + Mermaid。
 - 不要为了布局对称把内容切成无意义的两栏。
-- 如果一个章节需要更自由的结构，可以绕过 `ResearchQuestion` 组件，直接写 MDX。
+- 如果某个章节确实需要交互组件，可以写 React 组件，但不能遮蔽核心内容。
 
 ### Mermaid 使用原则
 
@@ -178,7 +180,7 @@ flowchart TD
 1. 先确认用户最新反馈，避免继续沿用旧方向。
 2. 如果修改已有章节，先阅读该章节当前内容。
 3. 如果涉及 Codex 源码判断，应优先从 `.env` 的 `CODEX_SOURCE_DIR` 指向的源码仓库核对源码，不要凭记忆写；不要把本机绝对路径写进文档。
-4. 新增、删除或重命名问答章节时，只同步维护 `website/sidebars.js`；不要维护手写问答索引。
+4. 新增、删除或重命名章节时，只同步维护 `website/sidebars.js`；不要维护手写章节清单。
 5. 使用 `apply_patch` 修改文件。
 6. 修改后运行 `cd website && npm run build`。
 7. 最终回复说明改了哪些文件，以及构建是否通过。

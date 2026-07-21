@@ -1,17 +1,35 @@
-# Codex Notebook
+# Codex 设计原理
 
-> 我提问，你研究本地的 codex 仓库代码，然后把回答变成 ebook 中的一章
+📚 在线阅读：https://luochang212.github.io/codex-notebook/
 
-Codex Notebook 是一个使用 Docusaurus 搭建的 Codex 架构问答笔记站点，框架结构参考 `luochang212/DL-Demos`：
+---
 
-- 研究对象：`openai/codex`
-- 在线地址：`https://luochang212.github.io/codex-notebook/`
-- 站点源码位于 `website/`
-- 文档入口位于 `website/docs/intro.mdx`
-- 问答索引由 `website/sidebars.js` 的 category `generated-index` 自动生成，访问路径为 `/qa`
-- 每个问答章节位于 `website/docs/qa/`
-- 侧边栏配置位于 `website/sidebars.js`
-- 站点配置位于 `website/docusaurus.config.js`
+一直好奇 Codex 是如何工作的。这不阿里发了 Qwen 3.8，就用它蹬了一本《Codex 设计原理》。
+
+最初蹬出来的效果很差。我修了两轮：一轮修语言风格，一轮修正确性。但都不是提升洞察深度的修法，能挖多深，还是要靠模型自身的功力。所以这是 Qwen 模型能力的有效参考哦！
+
+研究对象：[openai/codex](https://github.com/openai/codex)
+
+## 目录
+
+| 篇 | 章节 | 问题 |
+|---|---|---|
+| 序章 | intro | 这本书在讲什么 |
+| **第一篇：循环引擎** | ch01 | 谁拥有一次对话的生命周期？ |
+| | ch02 | 模型调用失败了怎么办？ |
+| | ch03 | 模型说"我要执行一个命令"，然后呢？ |
+| **第二篇：上下文工程** | ch04 | 模型看到的上下文是怎么拼出来的？ |
+| | ch05 | 聊了 200 轮，上下文装不下了怎么办？ |
+| | ch06 | 环境信息每步都变，怎么高效告诉模型？ |
+| **第三篇：工具与执行** | ch07 | 为什么不给 LLM 一个万能 bash 就够了？ |
+| | ch08 | 模型要执行 rm -rf /，系统怎么阻止？ |
+| **第四篇：安全与审批** | ch09 | 沙箱管不了的事，谁来管？ |
+| **第五篇：多 Agent** | ch10 | 子 agent 的角色为什么没有权限边界？ |
+| | ch11 | 子 agent 干完活了，父 agent 怎么知道？ |
+| **第六篇：扩展与配置** | ch12 | 为什么 skill 是 markdown 文件而不是插件代码？ |
+| | ch13 | 如何让第三方工具安全地接入 agent？ |
+| | ch14 | 你的配置为什么没生效？ |
+| **第七篇：设计哲学** | ch15 | 这 14 章背后只有一条线 |
 
 ## 本地运行
 
@@ -21,43 +39,7 @@ npm install
 npm run start
 ```
 
-## 构建
+## 部署
 
-```bash
-cd website
-npm run build
-```
+推送到 `main` 后，GitHub Actions 自动构建并发布到 GitHub Pages。
 
-## Mermaid 图表
-
-站点已启用 Docusaurus Mermaid 支持。需要展示流程、状态机或模块关系时，可以直接在 MDX 中写：
-
-````md
-```mermaid
-flowchart TD
-  A["输入"] --> B["处理"] --> C["输出"]
-```
-````
-
-## 在线发布
-
-本仓库使用 GitHub Actions 发布 Docusaurus 站点。推送到 `main` 后，`.github/workflows/deploy.yml` 会执行：
-
-```bash
-cd website
-npm ci
-npm run build
-```
-
-构建产物 `website/build` 会作为 GitHub Pages artifact 发布到线上地址。
-
-## 记录格式
-
-每个问答章节通常包含：
-
-- 原始问题
-- 研究主题或核心判断
-- 关键源码切片
-- 架构边界和取舍
-
-章节不维护额外的手写索引清单；问答索引由 `website/sidebars.js` 的 `generated-index` 自动生成。
