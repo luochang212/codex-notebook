@@ -1,23 +1,27 @@
 ---
 id: ch14-config-layers
-title: 全局默认、项目规则、目录级指令，如何合并？
+title: 你的配置为什么没生效？
 sidebar_label: 14. 配置层与 AGENTS.md
 ---
 
-## 设计问题
+你在 `~/.codex/config.toml` 里写了 `model = "o3"`。然后你打开一个项目，发现模型还是 o4-mini。
 
-一个企业用户：公司通过 MDM 推送了安全策略（禁止访问外网），用户自己配了偏好（用 vim 键位），项目有自己的规则（用 cargo 而不是 make），当前 session 有临时覆盖（这次用 debug 模式）。这些配置从哪来、谁优先、怎么合并？
+你检查了三遍配置文件。没有拼写错误。重启了 Codex。还是 o4-mini。
 
-## 直觉答案 vs 实际选择
+最后你在项目的 `.codex/config.toml` 里发现了一行：`model = "o4-mini"`。项目配置覆盖了你的全局配置。
 
-直觉上，一个配置文件搞定一切。`~/.codex/config.toml` 里写所有设置，项目里放一个 `.codex/config.toml` 覆盖部分设置。两层够了。
+这不是 bug。这是设计。但如果你不知道这套设计背后的层级结构，你会觉得自己在跟一个闹脾气的配置文件较劲。
 
-Codex 的实际选择是：**一套多层配置栈，每层有明确的优先级数值，高优先级覆盖低优先级。** 不是简单的"项目覆盖全局"，而是一个可以插入任意层数的有序栈。
+## 不是一个文件，是一个栈
 
-## 配置层的优先级
+Codex 的配置不是"读一个文件"。它把所有配置来源排成一个有序栈，从低到高逐层合并。高优先级层的同名字段覆盖低优先级层的。
+
+最终模型拿到的不是一个文件的内容，而是所有层合并后的**有效配置**。你的 `model = "o3"` 确实被读了，只是被更高优先级的层盖掉了。
+
+## 七层，从零到五十
 
 ```rust
-// codex-rs/config/src/config_layer_source.rs:31-48
+// codex-rs/config/src/config_layer_source.rs
 pub fn precedence(&self) -> i16 {
     match self {
         ConfigLayerSource::Mdm { .. } => 0,
@@ -34,94 +38,60 @@ pub fn precedence(&self) -> i16 {
 }
 ```
 
-从低到高：
+翻译成人话：
 
-| 优先级 | 层 | 来源 | 典型内容 |
-|--------|-----|------|----------|
-| 0 | MDM | 企业设备管理推送 | 安全策略、网络限制 |
-| 10 | System | 系统级配置文件 | 管理员设置 |
-| 15 | EnterpriseManaged | 企业云 bundle | 组织级配置 |
-| 20/21 | User | `~/.codex/config.toml` + profile | 个人偏好 |
-| 25 | Project | `.codex/config.toml` | 项目规则 |
-| 30 | SessionFlags | CLI 参数、角色覆盖 | 临时覆盖 |
-| 40-50 | Legacy | 旧版 managed_config.toml | 向后兼容 |
+| 数值 | 层 | 谁写的 | 例子 |
+|------|-----|--------|------|
+| 0 | MDM | 公司 IT 通过设备管理推送 | 禁止访问外网 |
+| 10 | System | 系统管理员 | 全局代理设置 |
+| 15 | Enterprise | 企业云 bundle | 组织级模型白名单 |
+| 20/21 | User | 你自己 | `~/.codex/config.toml` |
+| 25 | Project | 项目仓库 | `.codex/config.toml` |
+| 30 | SessionFlags | 这一次会话的 CLI 参数 | `--model o3` |
+| 40-50 | Legacy | 旧版兼容 | managed_config.toml |
 
-关键设计：优先级是**数值**，不是硬编码的层数。这意味着可以在任意两层之间插入新层，不需要重构整个系统。角色配置（ch10）就是以 `SessionFlags` 优先级插入的。
+你写的 `~/.codex/config.toml` 是 20。项目里的 `.codex/config.toml` 是 25。25 > 20，项目赢。
 
-## ConfigLayerStack：有序合并
+## 为什么是数值，不是硬编码层数？
 
-```rust
-// codex-rs/config/src/config_layer_source.rs:66-73
-pub struct ConfigLayer {
-    pub name: ConfigLayerSource,
-    pub version: String,
-    pub config: JsonValue,
-    pub disabled_reason: Option<String>,
-}
-```
+注意优先级是 `i16`，不是 enum 的顺序。0、10、15、20、25、30、40、50——中间有空隙。
 
-`ConfigLayerStack` 持有所有层的有序列表。`effective_config()` 从最低优先级开始，逐层 merge，高优先级覆盖低优先级的同名字段。被禁用的层（`disabled_reason` 非空）跳过。
+这意味着可以在任意两层之间插入新层，不需要改已有代码。假设未来需要一个"团队级"配置（比项目大、比用户小），给它一个 22 或 23 就行。不需要重构。
 
-这不是"选一个文件"，而是"把所有文件的字段合并成一个有效配置"。一个字段可能来自 MDM，另一个来自用户配置，第三个来自项目配置——它们共存于同一个有效配置中。
+角色配置（ch10 讲过的 spawn 时覆盖）就是以 SessionFlags 优先级（30）插入的。它不是"第 N 层"，它是"优先级为 30 的一个层"。
 
-## AGENTS.md：项目指令的发现和拼接
+## 合并，不是选择
 
-AGENTS.md 不是配置文件——它是写给模型看的项目指令。但它的发现机制和配置层类似：
+一个关键细节：这不是"选优先级最高的那个文件"。这是**字段级合并**。
 
-```rust
-// codex-rs/core/src/agents_md.rs:1-16（模块文档）
-//! 1. Determine the project root by walking upwards from the current working
-//!    directory until a configured `project_root_markers` entry is found.
-//!    When `project_root_markers` is unset, the default marker list is used
-//!    (`.git`).
-//! 2. Collect every `AGENTS.md` found from the project root down to the
-//!    current working directory (inclusive) and concatenate their contents
-//!    in that order.
-//! 3. We do **not** walk past the project root.
-```
+假设 MDM 层设了 `network_policy = "whitelist"`，User 层设了 `model = "o3"`，Project 层设了 `model = "o4-mini"` 和 `approval_policy = "full-auto"`。
 
-发现规则：
+有效配置是三个来源的合体：`network_policy` 来自 MDM，`model` 来自 Project（覆盖了 User），`approval_policy` 来自 Project。一个字段可能来自任何一层。它们共存于同一个有效配置中。
 
-1. 从 cwd 向上找 project root（默认标记是 `.git`）
-2. 从 project root 到 cwd 的每一级目录，收集所有 `AGENTS.md`
-3. 按从根到叶的顺序拼接
+被禁用的层（`disabled_reason` 非空）整体跳过，不参与合并。
 
-这意味着 monorepo 里，根目录的 `AGENTS.md` 和子包的 `AGENTS.md` 会同时生效——根目录的规则在前，子包的规则在后。
+## AGENTS.md：另一种"配置"
 
-```rust
-// codex-rs/core/src/agents_md.rs:38-44
-pub const DEFAULT_AGENTS_MD_FILENAME: &str = "AGENTS.md";
-pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
-const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
-```
+AGENTS.md 不是配置文件——它是写给模型看的项目指令。但它也有自己的发现和合并规则。
 
-还有一个 `AGENTS.override.md`——本地覆盖文件，不提交到版本控制。它和 `AGENTS.md` 用分隔符拼接。
+从当前目录向上找，找到 `.git` 标记就是 project root。然后从 root 到当前目录，每一级的 `AGENTS.md` 都收集起来，按从根到叶的顺序拼接。
 
-## AGENTS.md 在上下文中的位置
+monorepo 里，根目录写"所有包必须用 cargo"，子包写"本包额外要求 nightly toolchain"。两份同时生效。根的在前，子包的在后。模型看到的是拼接后的完整文本。
 
-AGENTS.md 的内容被注入模型的 developer context。它不是 system prompt 的一部分，而是作为 `UserInstructions` 注入。在 WorldState 中，它也有自己的 section（`AgentsMdState`），参与 baseline/diff 机制——如果 AGENTS.md 在 turn 之间被修改，只有变化部分会被记录。
+还有一个 `AGENTS.override.md`——本地覆盖，不提交版本控制。适合"我个人在这个项目里的额外偏好"。
 
-## 取舍
+AGENTS.md 在上下文中的位置：作为 developer instructions 注入模型。它也参与 WorldState 的 baseline/diff 机制（ch06）——如果 turn 之间有人改了 AGENTS.md，只有变化部分会被记录。
 
-**得到什么**：
+## 回到开头的问题
 
-- 企业可管控——MDM 层优先级最低但不可被用户覆盖（因为它是"要求"而非"偏好"）
-- 项目可定制——每个项目有自己的配置和指令，不影响全局
-- 临时可覆盖——session flags 优先级最高，调试时方便
-- 数值优先级可扩展——新增层不需要改已有逻辑
+你的 `model = "o3"` 没生效，因为项目配置优先级 25 > 用户配置优先级 20。
 
-**放弃什么**：
+解决方法有三个：改项目配置（如果你是项目维护者）、用 CLI 参数 `--model o3`（优先级 30，覆盖一切）、或者接受项目的设计意图。
 
-- 心智负担——用户需要理解"我的配置为什么没生效"（可能被更高优先级层覆盖）
-- 调试困难——有效配置是多层合并的结果，不容易一眼看出某个字段的来源
-- AGENTS.md 拼接可能冲突——根目录和子目录的指令可能矛盾，系统不做冲突检测
+这不是"配置系统太复杂"。这是"配置来自多个利益相关方"的现实。公司 IT 要管控安全，项目维护者要统一行为，个人要自定义偏好，这一次会话可能有临时需求。四方诉求不同，优先级不同。两层配置（全局 + 项目）覆盖不了企业场景。
 
-## 对读者的启示
-
-如果你的 agent 系统只面向个人用户，两层配置（全局 + 项目）就够了。但如果面向企业，你需要至少三层：组织策略（不可覆盖）、用户偏好、项目规则。
-
-核心洞察：**配置层的优先级数值不是"谁更重要"，而是"谁更具体"。** MDM 最通用（适用于所有设备），SessionFlags 最具体（只适用于这一次会话）。越具体的配置越应该覆盖越通用的配置——这是配置系统设计的通用原则。
+核心原则只有一条：**越具体的配置越应该覆盖越通用的配置。** MDM 适用于所有设备，所以最通用。SessionFlags 只适用于这一次会话，所以最具体。具体的覆盖通用的——这是所有配置系统设计的通用原则。Codex 只是把它显式化了。
 
 ---
 
-源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/config/src/config_layer_source.rs`、`codex-rs/core/src/agents_md.rs`、`codex-rs/core/src/agents_md_manager.rs`）
+源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/config/src/config_layer_source.rs`、`codex-rs/core/src/agents_md.rs`）

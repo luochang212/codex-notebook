@@ -4,136 +4,69 @@ title: 聊了 200 轮，上下文装不下了怎么办？
 sidebar_label: 5. 缓存与压缩
 ---
 
-## 设计问题
+下午两点，你开始让 Codex 重构一个认证模块。它读了 12 个文件，改了 5 个，跑了 3 次测试，修了 2 个 bug。到下午四点，你已经和它来回聊了 40 多轮。
 
-用户和 agent 聊了 200 轮，context window 装不下了。系统应该怎么做？直接截断旧消息？还是压缩成摘要？压缩的时机是什么？压缩后 prompt cache 还能命中吗？
+这时候发生了一件你看不见的事：context window 快满了。
 
-## 直觉答案 vs 实际选择
+128K token 的窗口，听起来很大。但 40 轮对话里，每轮包含模型输出、工具调用、工具结果、环境信息 diff……累积下来，已经用了 110K。还剩 18K。而模型下一次响应可能就需要 5K。再跑两个工具调用，就爆了。
 
-直觉上，快满了就截断最早的消息，简单粗暴。
+系统必须做点什么。但它不能简单地砍掉旧消息——那会让模型忘记自己改过哪些文件、为什么改、测试跑到哪了。
 
-Codex 的实际选择是：**用模型自己做摘要压缩（compaction），压缩后重建 baseline，prompt cache 从新 baseline 重新开始命中。** 压缩不是截断——它是一次有损的"换窗"操作，旧历史被摘要替代，但关键信息（文件操作记录、用户意图）被保留。
+## 压缩不是截断，是换窗
 
-## 触发时机：token budget 超限
+Codex 的做法是：把当前全部对话历史发给模型，让它写一段摘要。然后用这段摘要**替换**整个历史。
 
-```rust
-// codex-rs/core/src/session/context_window.rs
-pub(crate) struct ContextWindowTokenStatus {
-    pub(crate) auto_compact_scope_tokens: i64,
-    pub(crate) auto_compact_scope_limit: Option<i64>,
-    pub(crate) token_limit_reached: bool,
-    // ...
-}
-```
-
-每个 sampling step 结束后，turn 循环检查 `token_limit_reached`。如果超限：
-
-```rust
-// codex-rs/core/src/session/turn.rs:354
-if should_roll_over {
-    run_auto_compact(
-        &sess, step_context,
-        InitialContextInjection::BeforeLastUserMessage(world_state),
-        CompactionReason::ContextLimit,
-        CompactionPhase::MidTurn,
-    ).await?;
-    continue;  // 压缩完继续循环
-}
-```
-
-压缩发生在 turn 中间（`MidTurn`），不中断用户交互。压缩完直接 `continue`，模型看到的是压缩后的历史。
-
-## 压缩做什么
-
-```rust
-// codex-rs/core/src/compact.rs:92
-pub(crate) async fn run_inline_auto_compact_task(
-    sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
-    initial_context_injection: InitialContextInjection,
-    reason: CompactionReason,
-    phase: CompactionPhase,
-) -> CodexResult<()> {
-    let prompt = turn_context.config.compact_prompt
-        .as_deref()
-        .unwrap_or(SUMMARIZATION_PROMPT);
-    // 用模型对当前历史做摘要
-    run_compact_task_inner(sess, turn_context, input, ...).await
-}
-```
-
-压缩的核心是：把当前对话历史发给模型，让它生成一段摘要。然后用这段摘要**替换**整个历史，重新注入 initial context（base instructions + world state）。
+不是截断前 N 条消息。不是只保留最近 K 轮。是让模型自己总结："我做了什么、为什么做、当前状态是什么、下一步计划是什么"。然后旧历史消失，摘要成为新的起点。
 
 压缩后保留什么：
+
 - 摘要文本（模型生成的）
-- 文件操作记录（`readFiles`、`modifiedFiles`）
-- 最后一条用户消息（`BeforeLastUserMessage` 注入点）
-- 完整的 world state baseline
+- 文件操作记录（读过哪些、改过哪些）
+- 最后一条用户消息
+- 完整的 world state baseline（环境信息重新全量注入）
 
-丢弃什么：
-- 所有中间 tool call 和 tool result
-- 所有中间推理过程
-- 旧的 context diff 序列
+丢弃什么：所有中间 tool call 和 tool result、所有中间推理过程、旧的 context diff 序列。
 
-## 压缩与 prompt cache 的关系
+## 压缩发生在 turn 中间，不打断你
 
-这是最精妙的部分。压缩前：
+这是最巧妙的设计：压缩不需要用户参与。它发生在 turn 循环的内部——模型调完一次工具后，系统检查 token 用量，发现超限，就地压缩，然后 `continue` 继续循环。
 
-```
-[base instructions] [world state] [diff1] [diff2] ... [user msg] [assistant] [tool call] ...
-|<——————————————— prompt cache 前缀 ————————————————>|
-```
+用户看到的是什么？什么都没有。也许模型停顿了一两秒（压缩本身是一次模型调用），然后它继续干活。它不会说"上下文快满了，我来压缩一下"。它只是继续。
 
-压缩后：
+## 压缩重置了 prompt cache
 
-```
-[base instructions] [world state（新 baseline）] [摘要] [最后用户消息]
-|<——————————— 新的 prompt cache 前缀 ———————————>|
-```
+这里有一个隐性成本，和 ch04 直接相关。
 
-压缩**重置了 baseline**。旧的 diff 序列全部丢弃，新的 baseline 包含压缩时刻的完整 world state。从下一次 sampling 开始，prompt cache 基于新前缀重新积累。
+压缩前，对话历史的前缀（base instructions + world state baseline）是稳定的，prompt cache 持续命中。压缩后，旧历史被摘要替代，baseline 重建——前缀变了。下一次请求一定 cache miss。
 
-这意味着压缩有一个隐性成本：压缩后的第一次请求一定 cache miss（因为前缀变了）。但后续请求会基于新前缀重新命中。
+但只 miss 一次。从新 baseline 开始，后续请求重新积累 cache。
+
+这是一个有意识的取舍：一次 cache miss 的成本，远低于模型因为上下文不连贯而犯错的代价。如果只截断前面而不重置 baseline，cache 前缀不变，但模型看到的上下文是断裂的——摘要和旧 baseline 对不上。Codex 选了"贵一次但连贯"，而不是"便宜但精神分裂"。
+
+## 摘要质量是软肋
+
+这套机制有一个无法用工程解决的弱点：摘要质量取决于模型。
+
+如果模型写了一段很好的摘要——关键决策、文件变更、未完成任务都记下来了——后续行为几乎不受影响。但如果摘要写得差——漏掉了"用户说过不要动 auth 模块"这个约束——后续模型可能就会去动 auth 模块。
+
+这是一个有损操作，而且损失不可预测。没有"压缩后验证摘要完整性"的机制。压缩完就完了，模型基于摘要继续工作。
 
 ## 两种压缩路径
 
-```rust
-// codex-rs/core/src/compact.rs:88
-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
-    provider.supports_remote_compaction()
-}
-```
+Codex 支持本地压缩和远程压缩：
 
-- **本地压缩**（`run_inline_auto_compact_task`）：用当前模型做摘要，结果回注本地历史
-- **远程压缩**（`run_inline_remote_auto_compact_task`）：provider 支持时，压缩在服务端完成
+- **本地**：用当前模型做摘要，消耗本地 token budget
+- **远程**：provider 支持时，压缩在服务端完成，不算在用户的 token 用量里
 
-远程压缩的优势是不消耗本地 token budget（摘要请求不算在用户的 token 用量里）。
+远程压缩的优势是成本透明——用户不会因为"系统自己做了一次摘要"而被多收钱。但不是所有 provider 都支持。
 
-## 取舍
+## 回到那个下午四点
 
-**得到什么**：
+你的 session 在压缩后继续运行。模型看到的是一段几百 token 的摘要，而不是 110K token 的完整历史。它知道自己改过哪些文件、测试状态如何、下一步要做什么。但它不再记得第 7 轮时你说过的一句随口评论，也不再记得第 15 轮时它尝试过但放弃的一个方案。
 
-- 对话可以无限延续——不会因为 context window 满了就中断
-- 摘要保留了语义信息——比简单截断好得多
-- 文件操作记录不丢——模型压缩后仍然知道改过哪些文件
+这是有意的。那些细节在当时的上下文里有意义，但对"接下来做什么"已经不重要了。如果它们真的重要，摘要会记住。如果不重要，忘了就忘了。
 
-**放弃什么**：
-
-- 压缩是有损的——细节（具体的代码行号、中间推理步骤）会丢失
-- 压缩消耗一次模型调用——有延迟和成本
-- 压缩后 cache 重置——第一次请求一定 miss
-- 摘要质量取决于模型——如果模型摘要写得差，后续行为会偏
-
-## 对读者的启示
-
-如果你的 agent 系统面向短对话（< 20 轮），不需要 compaction。但如果是 coding agent（用户可能连续工作几小时），compaction 是必须的。
-
-核心设计决策是：**压缩后怎么处理 baseline？**
-
-- 如果不重置 baseline（只截断前面）：cache 前缀不变，但模型看到的上下文不连贯
-- 如果重置 baseline（Codex 的做法）：cache 重置一次，但模型看到的上下文是完整自洽的
-
-Codex 选了后者，因为对模型来说，"看到一段连贯的摘要"比"看到一段被截断的历史"更重要。cache miss 一次的成本远低于模型因为上下文不连贯而犯错的代价。
+对话可以无限延续。代价是：越远的记忆越模糊。就像人一样。
 
 ---
 

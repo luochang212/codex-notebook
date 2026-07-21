@@ -4,130 +4,77 @@ title: 如何让第三方工具安全地接入 agent？
 sidebar_label: 13. MCP 与插件
 ---
 
-## 设计问题
+上一章的结论是：skill 只能注入知识，不能执行代码。你写一份 `SKILL.md` 告诉模型"部署时先跑 migration 再切流量"，模型确实会按这个顺序来。但它跑不了 migration。它没有手。
 
-skill 只能注入知识，不能执行代码。如果用户想让 agent 调用 GitHub API、操作数据库、或者使用自定义的部署工具，怎么办？这些能力需要真正的运行时——进程、网络连接、API 调用。
+知识用文档就够了。能力需要进程。
 
-## 直觉答案 vs 实际选择
+这一章讲的就是"手"的问题：怎么让 agent 调用 GitHub API、操作数据库、执行自定义部署脚本——同时不让这些外部代码碰到 agent 的内部状态？
 
-直觉上，让第三方写一个动态库或脚本，agent 在沙箱里加载执行。像 IDE 插件那样。
+## 一个进程边界
 
-Codex 的实际选择是：**采用 MCP（Model Context Protocol）作为外部工具的标准接入协议。** 第三方工具作为独立的 MCP server 进程运行，通过 stdio 或 HTTP 与 agent 通信。agent 只看到工具的 schema（name + description + parameters），不知道工具的实现语言、运行位置或内部逻辑。
+答案很朴素：把第三方工具放在独立进程里。
 
-## MCP 的接入架构
+MCP server 就是一个独立进程。它可以用 Python 写，可以用 Go 写，可以跑在本机，也可以跑在远端。agent 通过 stdio 或 HTTP 跟它说话，说的内容是 JSON-RPC：「调用这个工具，参数是这些」。server 干完活，把结果用 JSON 回传。
 
-```mermaid
-flowchart TD
-    A["模型输出 tool_call"] --> B["ToolRouter 路由"]
-    B --> C{"是 MCP 工具？"}
-    C -->|是| D["McpHandler 处理"]
-    D --> E["McpConnectionManager 找到对应 server"]
-    E --> F["通过 stdio/HTTP 发送 call_tool 请求"]
-    F --> G["MCP server 执行并返回结果"]
-    G --> H["结果回注到 turn 循环"]
-    C -->|否| I["内建工具 handler 处理"]
-```
+agent 不知道 server 的实现语言。server 不知道 agent 的内部结构。它们之间只有一份合同：tool schema（name + description + parameters）。
 
-`McpConnectionManager` 管理所有活跃的 MCP server 连接：
+这跟微服务的思路一样。但比微服务简单——没有服务发现、没有负载均衡、没有熔断。一个 agent 对一组 server，点对点。
 
-```rust
-// codex-rs/codex-mcp/src/connection_manager.rs:116-124
-pub struct McpConnectionManager {
-    clients: HashMap<String, AsyncManagedClient>,
-    server_metadata: HashMap<String, McpServerMetadata>,
-    required_servers: Vec<String>,
-    tool_plugin_provenance: Arc<ToolPluginProvenance>,
-    prefix_mcp_tool_names: bool,
-    elicitation_requests: ElicitationRequestManager,
-    startup_cancellation_token: CancellationToken,
-}
-```
+## 300 个工具的问题
 
-每个 MCP server 是一个独立的进程。`clients` 维护 server name → 客户端连接的映射。`required_servers` 标记哪些 server 是必须成功启动的——如果 required server 启动失败，整个 session 报错。
+假设你接了 30 个 MCP server，每个提供 10 个工具。300 个 tool spec 塞进模型的 tool list，光 schema 就占几万 token。模型还没开始干活，context window 已经被工具说明书吃掉了。
 
-## 工具暴露：从 MCP tool 到模型可见的 tool spec
+Codex 的解法分两档：
 
-MCP server 注册的工具不是直接暴露给模型的。`build_mcp_tool_runtimes` 做过滤和转换：
+**Direct 模式**：工具的完整 schema 直接出现在 tool list 里。模型每次调用都能看到所有工具。适合工具少的场景。
 
-```rust
-// codex-rs/core/src/mcp_tool_exposure.rs:20-56（节选）
-pub(crate) fn build_mcp_tool_runtimes(
-    all_mcp_tools: &[McpToolInfo],
-    connectors: Option<&[connectors::AppInfo]>,
-    config: &Config,
-    search_tool_enabled: bool,
-) -> Vec<Arc<dyn CoreToolRuntime>> {
-    let mut exposed_tools = filter_non_codex_apps_mcp_tools_only(all_mcp_tools);
-    if let Some(connectors) = connectors {
-        exposed_tools.extend(filter_codex_apps_mcp_tools(all_mcp_tools, connectors, config));
-    }
-    let exposure = if search_tool_enabled {
-        ToolExposure::Deferred
-    } else {
-        ToolExposure::Direct
-    };
-    exposed_tools.into_iter().filter_map(|tool| {
-        match McpHandler::new(tool) {
-            Ok(handler) => Some(override_tool_exposure(Arc::new(handler), exposure)),
-            Err(err) => { warn!("Skipping MCP tool: {err}"); None }
-        }
-    }).collect()
-}
-```
+**Deferred 模式**：工具不直接出现。模型先看到一个搜索入口，按需查找，找到后再加载具体 schema。300 个工具变成了"一个搜索框 + 按需加载"。
 
-两个关键过滤：
+判断用哪种模式的逻辑在 `build_mcp_tool_runtimes` 里，一行分支：如果启用了 search tool，走 Deferred；否则走 Direct。
 
-1. **可见性过滤**：`tool_is_model_visible` 检查工具的 meta 中是否标记了 model 可见性。不可见的工具不进入模型的 tool list。
-2. **暴露模式**：如果启用了 search tool（`ToolExposure::Deferred`），MCP 工具不直接出现在 tool list 里，而是通过搜索按需发现。
+## 不是所有工具都对模型可见
 
-## 审批：MCP 工具调用不是无条件执行的
+MCP server 注册的工具里，有些是给编排层用的（比如健康检查、版本查询），模型不需要看到。每个工具的 meta 里可以标记 model 可见性。不可见的工具仍然存在于连接中，但不会进入模型的 tool list。
 
-MCP 工具调用经过和内建工具相同的审批流程。`mcp_tool_call.rs` 在执行前检查：
+这层过滤发生在 agent 侧，不在 server 侧。server 可以注册 20 个工具，agent 只暴露其中 5 个给模型。
 
-- **exec policy**：MCP 工具是否在白名单中
-- **guardian 审批**：如果 approval_policy 要求审批，构造 `GuardianApprovalRequest::McpToolCall` 发给 guardian
-- **用户审批**：guardian 拒绝或不可用时，升级给用户
+## 审批不因为是外部的就更宽松
 
-```rust
-// codex-rs/core/src/mcp_tool_call.rs 的 import 列表（节选）
-use crate::guardian::GuardianApprovalRequest;
-use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian_with_reviewer;
-```
+一个常见误解：外部工具应该被更严格地审批。
 
-MCP 工具不因为是"外部的"就获得更宽松或更严格的审批——它和内建工具走同一条审批链路。
+Codex 没有这样做。MCP 工具调用经过和内建工具**相同的**审批链路：exec policy 检查 → guardian 审批（如果启用）→ 用户审批（如果需要）。不因为是"外部的"就加一层，也不因为"已经通过 MCP 协议了"就减一层。
 
-## 插件系统：MCP 之上的管理层
+这背后有一个判断：审批的对象是**操作的后果**，不是**工具的来源**。`git push --force` 不管是内建工具调的还是 MCP 工具调的，后果一样。
 
-`PluginsManager` 在 MCP 之上提供了一层管理抽象：
+但有一个 MCP 特有的安全边界值得注意：审批能控制"是否调用"，不能控制"调用结果是否可信"。一个恶意 MCP server 可以返回误导性结果——比如告诉你"测试全部通过"但其实没跑。agent 没有能力验证外部 server 的返回值。这是信任边界。
 
-- **发现**：从配置中读取 plugin 定义，解析出 MCP server 配置
-- **生命周期**：管理 plugin 的安装、启用、禁用
-- **skill 集成**：plugin 可以携带 skill（`plugin_skill_snapshots`）
+## required server：启动失败就是 fatal
 
-plugin 不是另一种工具协议——它是 MCP server 的打包和分发方式。一个 plugin 就是一个预配置的 MCP server + 可选的 skill 文件。
+`McpConnectionManager` 管理所有活跃的 server 连接。每个 server 有一个标记：required 或 optional。
 
-## 取舍
+required server 启动失败，整个 session 报错，不进入对话。optional server 启动失败，静默跳过，后续调用时再报错。
 
-**得到什么**：
+为什么区分？因为有些工具是任务的前提。如果你的部署流程依赖一个数据库 MCP server，它没起来就开始对话，模型会尝试调用一个不存在的工具，得到错误，重试，再错误——浪费 token 和用户时间。不如一开始就说清楚：这个 server 没起来，今天干不了活。
 
-- 标准化协议——任何语言实现的 MCP server 都能接入，不依赖 agent 的运行时
-- 进程隔离——MCP server 是独立进程，崩溃不影响 agent 主进程
-- 生态独立演进——工具开发者不需要了解 agent 内部，只需实现 MCP 协议
-- 统一审批——MCP 工具不绕过安全机制
+## 插件：MCP 的打包分发
 
-**放弃什么**：
+`PluginsManager` 在 MCP 之上加了一层薄包装：一个 plugin = 一个预配置的 MCP server + 可选的 skill 文件。
 
-- 间接层增加延迟——每次工具调用都要跨进程通信（stdio/HTTP）
-- 调试复杂度——问题可能在 agent、MCP client、MCP server 三层中的任何一层
-- 启动成本——每个 MCP server 是独立进程，需要启动时间
-- 能力受限于协议——MCP 协议不支持的功能（如流式输出、双向交互）无法使用
+它不是另一种协议。它解决的是"怎么把 MCP server 打包给用户安装"的问题。用户不需要手动编辑 config 文件写 server 地址和参数——安装一个 plugin 就行。
 
-## 对读者的启示
+skill + MCP server 的组合也自然：skill 告诉模型"什么时候该用这个工具、用的时候注意什么"，MCP server 提供实际执行能力。知识 + 能力，文档 + 进程。
 
-如果你的 agent 需要接入外部工具，MCP 是目前最标准化的选择。但要注意：MCP 解决的是"工具接入"问题，不是"工具安全"问题。一个恶意的 MCP server 仍然可能返回误导性结果。审批机制能控制"是否调用"，但不能控制"调用结果是否可信"。
+## 代价
 
-核心洞察：**MCP 把"工具实现"和"工具使用"彻底解耦。** agent 不需要知道工具是怎么实现的，工具不需要知道 agent 的内部结构。这种解耦让工具生态可以独立于 agent 演进——但代价是每次调用都多了一层进程间通信。
+每次工具调用都跨进程。stdio 通信的延迟在毫秒级，HTTP 在几十毫秒级。对于"读一个文件"这种操作，内建工具微秒级完成，MCP 工具要多走一圈。
+
+调试变难了。问题可能在 agent 侧（路由错误）、MCP client 侧（序列化失败）、MCP server 侧（逻辑 bug）。三层栈，每层有自己的日志。
+
+每个 server 是独立进程，有启动时间。10 个 server 的冷启动可能需要几秒。
+
+换来的：任何语言都能写 MCP server。server 崩溃不影响 agent 主进程。工具生态可以独立于 agent 版本演进。
+
+一句话：MCP 用进程隔离换来了语言无关和故障隔离，代价是每次调用多一跳。对于"执行能力"这个需求，这一跳值得。
 
 ---
 

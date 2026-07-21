@@ -4,175 +4,53 @@ title: 子 agent 干完活了，父 agent 怎么知道？
 sidebar_label: 11. 通信与回收
 ---
 
-## 设计问题
+你给三个同事分别布置了一个任务。然后你继续干自己的事。某个同事做完了，他不会拍你肩膀说"嘿，我做完了"——他会在你的收件箱里放一张备忘录。你下次查看收件箱时看到它，然后决定下一步。
 
-父 agent spawn 了三个子 agent 并行工作。它们各自独立运行，有自己的 Session 和 turn 循环。当某个子 agent 完成任务时，结果怎么回到父 agent？如果子 agent 崩溃了呢？如果父 agent 已经不等了呢？
+Codex 的多 agent 通信就是这个模型。子 agent 完成后不会"回调"父 agent，不会中断父 agent 的当前工作。它只是往父 agent 的 input queue 里塞了一条消息。父 agent 下次空闲时看到它，就像看到一条普通的用户输入一样处理。
 
-## 直觉答案 vs 实际选择
+没有 RPC，没有服务发现，没有消息队列。多 agent 通信被还原成了单 agent 的输入处理。
 
-直觉上，子 agent 完成后直接"调用"父 agent 的某个接口，把结果传回去。像 RPC 的 callback。
+## V1：一个监听者在走廊里等
 
-Codex 的实际选择是：**子 agent 的完成通知被编码为一条消息，注入父 agent 的 input queue。** 父 agent 不是被"回调"，而是在下一次处理输入时"看到"子 agent 的结果。这是一个消息传递模型，不是 RPC 模型。
+V1 协议下，spawn 子 agent 时系统会启动一个 detached 的 completion watcher。它不做任何事，只是订阅子 agent 的状态 channel，然后等。
 
-## V1：completion watcher 被动监听
+等什么呢？等子 agent 的状态变成 final——Completed、Errored、或 Interrupted。一旦状态变为 final，watcher 构造一条通知消息（包含子 agent 的引用名和最终状态），然后调用 `inject_user_message_without_turn` 把消息塞进父 agent 的 input queue。
 
-V1 协议下，spawn 时系统启动一个 detached 的 completion watcher：
+关键：这条消息不会立即触发父 agent 的新 turn。它只是排队。父 agent 可能正在忙别的事，这条消息就安静地等着。等父 agent 下次空闲，它会被当作一条普通的用户输入处理。
 
-```rust
-// codex-rs/core/src/agent/control.rs:435-517（节选）
-fn maybe_start_completion_watcher(
-    &self,
-    child_thread_id: ThreadId,
-    session_source: Option<SessionSource>,
-    child_reference: String,
-    child_agent_path: Option<AgentPath>,
-) {
-    let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id, ..
-    })) = session_source else { return; };
+watcher 是一次性的。通知发完，它就消失了。如果 watcher 在子 agent 完成前崩溃了，通知丢失。没有重试机制。
 
-    let control = self.clone();
-    tokio::spawn(async move {
-        let status = match control.subscribe_status(child_thread_id).await {
-            Ok(mut status_rx) => {
-                let mut status = status_rx.borrow().clone();
-                while !is_final(&status) {
-                    if status_rx.changed().await.is_err() {
-                        status = control.get_status(child_thread_id).await;
-                        break;
-                    }
-                    status = status_rx.borrow().clone();
-                }
-                status
-            }
-            Err(_) => control.get_status(child_thread_id).await,
-        };
-        if !is_final(&status) { return; }
-        // ... 构造通知消息，注入父 agent
-        let message = format_subagent_notification_message(child_reference.as_str(), &status);
-        parent_thread.inject_user_message_without_turn(message).await;
-    });
-}
-```
+## V2：子 agent 自己发备忘录
 
-工作流程：
+V2 协议下，没有外部 watcher。子 agent 的 Session 在自己的 terminal turn 事件处理中主动通知父 agent。
 
-1. watcher 订阅子 agent 的 `agent_status` watch channel
-2. 循环等待状态变化，直到状态变为 final（Completed / Errored / Interrupted）
-3. 构造一条通知消息（包含子 agent 的引用名和最终状态）
-4. 调用 `inject_user_message_without_turn` 把消息塞进父 agent 的 input queue
+区别在哪？V1 是"别人帮你盯着，做完了别人通知你"。V2 是"我自己做完了，我自己发备忘录"。
 
-关键：`inject_user_message_without_turn` 不会立即触发父 agent 的新 turn。消息只是排队，等父 agent 下一次空闲时处理。
+V2 的通知走 `InterAgentCommunication`——一个结构化的 agent 间通信对象，包含发送者路径、接收者路径、消息内容和类型。不是纯文本，是结构化数据。
 
-## V2：Session 自身主动转发
+## 回收：做完了不代表消失
 
-V2 协议下，没有外部 watcher。子 agent 的 Session 在自己的 terminal turn 事件处理中主动通知父 agent：
+V2 子 agent 完成后不会被立即销毁。它进入"resident"状态，保留在内存中，可以被后续消息重新激活。
 
-```rust
-// codex-rs/core/src/session/mod.rs:1801-1847（节选）
-async fn maybe_notify_parent_of_terminal_turn(
-    &self,
-    turn_context: &TurnContext,
-    msg: &EventMsg,
-) {
-    if turn_context.multi_agent_version != MultiAgentVersion::V2 { return; }
-    if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) { return; }
+但内存有限。当需要 spawn 新子 agent 但容量已满时，系统用 LRU 驱逐：从最久未使用的开始，检查它是否可卸载（状态已终结、没有活跃 turn、没有排队消息）。三个条件缺一不可——不会在子 agent 还在工作时把它杀掉。
 
-    let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id,
-        agent_path: Some(child_agent_path),
-        ..
-    }) = &turn_context.session_source else { return; };
+如果所有候选者都不可卸载，返回 `AgentLimitReached` 错误。父 agent 会看到"无法创建新子 agent"，然后自己决定怎么办。
 
-    let status = /* 从 terminal event 提取最终状态 */;
-    if !is_final(&status) { return; }
+## 通知没有过期机制
 
-    self.forward_child_completion_to_parent(
-        turn_context, *parent_thread_id, child_agent_path, status,
-    ).await;
-}
-```
+子 agent 的完成通知被注入父 agent 后，它就变成了父 agent 对话历史的一部分。没有"已读后删除"，没有"N 步后自动过期"。它和所有其他历史消息一样，靠 compaction 统一处理。
 
-V2 的回传走 `InterAgentCommunication`——一个结构化的 agent 间通信对象，包含发送者路径、接收者路径、消息内容和类型。它通过 `send_inter_agent_communication` 投递到父 agent。
+这意味着：如果父 agent 和很多子 agent 交互频繁，完成通知会不断累积，直到触发 compaction 被摘要压缩。系统不为通知设计独立的清理逻辑——复用已有的 compaction 机制，少一套代码。
 
-## V1 vs V2 的核心区别
+## 为什么不用 RPC？
 
-| 维度 | V1 | V2 |
-|------|----|----|
-| 通知触发者 | 外部 completion watcher（detached task） | 子 agent 的 Session 自身 |
-| 通知载体 | 纯文本 user message | 结构化 InterAgentCommunication |
-| 容量管理 | AgentRegistry 的 spawn slot 计数 | V2Residency 的 LRU 驱逐 |
-| 恢复能力 | 无（watcher 是一次性的） | 支持 `ensure_v2_agent_loaded` 重新加载 |
+因为 RPC 要求父 agent "等待"子 agent。但 Codex 的 Session 是串行的——一个 Session 同一时刻只能跑一个 turn。如果父 agent 阻塞等待子 agent，它就什么都做不了了。
 
-## 回收：V2Residency 的 LRU 驱逐
+消息传递模型让父 agent 完全解耦：它不需要知道子 agent 的内部结构，不需要等待，不需要处理回调。它只需要在下次处理输入时，看到收件箱里多了一条消息。
 
-V2 子 agent 完成后不会被立即销毁。它进入"resident"状态，保留在内存中，可以被后续消息重新激活。但内存有限，所以需要驱逐：
+代价是：父 agent 不能"同步等待子 agent 的结果"。如果你需要"父 agent 阻塞直到子 agent 返回"，这个设计不适合你。但 Codex 的场景是异步的：父 agent 继续工作，子 agent 结果稍后到达。就像你给同事布置任务后不会站在旁边等，而是回去干自己的事。
 
-```rust
-// codex-rs/core/src/agent/control/residency.rs:80-101（节选）
-async fn reserve_slot(
-    self: Arc<Self>,
-    manager: &Arc<ThreadManagerState>,
-    capacity: usize,
-    protected_thread_id: Option<ThreadId>,
-) -> CodexResult<V2ResidencySlot> {
-    loop {
-        if self.try_reserve_pending_slot(capacity) {
-            return Ok(V2ResidencySlot { residency: self, active: true });
-        }
-        if !self.try_unload_one_resident(manager, protected_thread_id).await {
-            return Err(CodexErr::AgentLimitReached { max_threads: capacity });
-        }
-    }
-}
-```
-
-当需要 spawn 新子 agent 但容量已满时：
-
-1. 从 `residents` 队列头部取最久未使用的候选者（LRU）
-2. 检查它是否可卸载（状态为 final、没有活跃 turn、没有待处理消息）
-3. 如果可卸载：持久化 rollout → shutdown → 从 ThreadManager 移除
-4. 如果不可卸载：跳过，尝试下一个候选者
-5. 所有候选者都不可卸载：返回 `AgentLimitReached` 错误
-
-```rust
-// codex-rs/core/src/agent/control/residency.rs:225-231
-async fn is_unloadable(thread: &CodexThread) -> bool {
-    matches!(
-        thread.agent_status().await,
-        AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
-    ) && thread.session.active_turn.lock().await.is_none()
-        && !thread.session.input_queue.has_pending_mailbox_items().await
-}
-```
-
-三个条件缺一不可：状态已终结、没有正在执行的 turn、没有排队的消息。这保证了不会在子 agent 还在工作时把它杀掉。
-
-## 通知消息的生命周期
-
-子 agent 的完成通知被注入父 agent 后，它就变成了父 agent conversation history 的一部分。它没有独立的过期机制——和所有其他历史消息一样，靠 compaction 统一处理。
-
-这意味着：如果父 agent 和子 agent 交互频繁，完成通知会不断累积，直到触发 compaction 被摘要压缩。系统不做"通知已读后删除"或"N 步后自动过期"。
-
-## 取舍
-
-**得到什么**：
-
-- 消息传递模型让父子 agent 完全解耦——子 agent 不需要知道父 agent 的内部结构
-- V2 的 LRU 驱逐让"已完成但可能还需要"的子 agent 可以被重新激活
-- 不做精细的通知过期，复用已有的 compaction 机制——少一套独立的清理逻辑
-
-**放弃什么**：
-
-- 通知是异步的——父 agent 不能"等待子 agent 完成"，只能在后续 turn 中看到结果
-- V1 的 completion watcher 是一次性的——如果 watcher 在子 agent 完成前崩溃，通知丢失
-- 通知没有过期——大量子 agent 完成通知可能占据父 agent 的上下文窗口
-
-## 对读者的启示
-
-如果你的多 agent 系统需要同步等待（"父 agent 阻塞直到子 agent 返回"），Codex 的消息传递模型不适合你。但如果你接受异步模型（"父 agent 继续工作，子 agent 结果稍后到达"），这个设计极其简单——不需要 RPC 框架、不需要服务发现、不需要消息队列。
-
-核心洞察：**子 agent 的结果不是"返回"给父 agent，而是"发生"在父 agent 的输入流里。** 这把多 agent 通信还原成了单 agent 的输入处理——父 agent 不需要任何新的机制来消费子 agent 的结果。
+子 agent 的结果不是"返回"给父 agent，而是"发生"在父 agent 的输入流里。这一句话就是整个多 agent 通信的设计哲学。
 
 ---
 

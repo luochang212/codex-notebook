@@ -4,142 +4,60 @@ title: 模型说"我要执行一个命令"，然后呢？
 sidebar_label: 3. 工具执行循环
 ---
 
-## 设计问题
+模型在一次响应里输出了 4 个 tool call：3 个 `read`（读三个不同的文件）和 1 个 `shell`（跑 `cargo test`）。
 
-模型在响应中输出了一个 tool call（比如"执行 `git status`"）。系统应该怎么处理？是立即执行、排队等待、还是先问用户？如果模型一次输出多个 tool call，是串行还是并行？
+系统现在面对一个很具体的问题：这 4 个操作，先跑哪个？同时跑还是排队？如果 `cargo test` 跑到一半用户按了 Ctrl+C，那 3 个 read 的结果怎么办？如果 `cargo test` 返回了非零退出码，整个 turn 是崩了还是继续？
 
-## 直觉答案 vs 实际选择
+这些问题的答案，藏在一个 `RwLock<()>` 里。
 
-直觉上，收到 tool call 就执行，执行完把结果塞回历史，继续调模型。简单直接。
+## 读可以并发，写必须独占
 
-Codex 的实际选择是：**工具执行是 turn 循环的内嵌环节，不是外挂。** 每个 tool call 经过一条完整的链路：spec 注册 → 路由分发 → 并行/串行门控 → handler 执行 → 结果回注历史 → 循环继续。这条链路里有审批拦截、沙箱约束、中断处理，但 turn 循环本身只看到一个布尔值：`needs_follow_up`。
+3 个 `read` 互不干扰——它们只是读文件，不改任何东西。让它们排队等是浪费。但 `shell` 不一样：`cargo test` 会写 target/ 目录、可能改文件锁、可能起子进程。如果它和另一个写操作同时跑，结果不可预测。
 
-## Turn 循环里的工具执行
+Codex 用了一个极其简洁的门控：一把 `RwLock<()>`。锁里面没有数据，就是一个空元组——它不保护任何资源，只保护**执行权**。
 
-回顾 ch01 的 turn 循环：
+支持并行的工具（read、grep、web_search）拿 read lock。多个 read lock 可以同时持有。不支持并行的工具（shell、apply_patch）拿 write lock。Write lock 独占，必须等所有 read lock 释放。
 
-```rust
-loop {
-    let result = run_sampling_request(...).await;
-    match result {
-        Ok(output) if output.needs_follow_up => continue,  // 有 tool call，继续
-        Ok(_) => break,                                     // 纯文本，结束
-        Err(...) => break,
-    }
-}
-```
+所以那 4 个 tool call 的执行顺序是：3 个 read 同时跑，shell 等它们全部完成后再开始。不需要调度器，不需要优先级队列。RwLock 的语义天然表达了"读可以并发，写必须独占"。
 
-`needs_follow_up = true` 意味着：模型输出了 tool call → 工具已执行 → 结果已回注历史 → 需要再调一次模型。整个工具执行发生在 `run_sampling_request` 内部，对 turn 循环透明。
+代价是：即使模型想并行 apply 两个不冲突的 patch（改两个完全不同的文件），也必须排队。系统不做冲突检测，一律串行。简单，但保守。
 
-## ToolRouter：从名字到 handler
+## 工具失败不是灾难
 
-```rust
-// codex-rs/core/src/tools/router.rs:35
-pub struct ToolRouter {
-    registry: ToolRegistry,
-    model_visible_specs: Vec<ToolSpec>,
-}
-```
+`cargo test` 跑完了，退出码 1。测试失败了。
 
-`ToolRouter` 做两件事：
+在大多数人的直觉里，"命令失败"应该触发某种错误处理——重试？回滚？报告用户？
 
-1. 持有 `model_visible_specs`——发给模型的 tool schema 列表（模型只能调它看到的工具）
-2. 通过 `registry` 把 tool name 路由到对应的 handler
+Codex 的选择更有趣：**把错误信息当成工具的正常输出，塞回对话历史，让模型自己决定下一步。**
 
-每个 step 重建一个 `ToolRouter`（因为可用工具集可能随配置变化），但 handler 本身是无状态的。
+测试失败的 stderr 变成了 tool result 的一部分。模型看到"test result: FAILED. 3 passed; 2 failed"，然后自己判断：是改代码再跑一次，还是换个思路。Turn 循环不中断。
 
-## 并行与串行：RwLock 门控
+只有一种情况会真正杀掉 turn：`Fatal` 错误——比如沙箱进程本身崩溃了。普通的"命令返回非零""文件不存在""权限不够"，都是信息，不是灾难。
 
-```rust
-// codex-rs/core/src/tools/parallel.rs:42
-pub(crate) struct ToolCallRuntime {
-    router: Arc<ToolRouter>,
-    session: Arc<Session>,
-    step_context: Arc<StepContext>,
-    parallel_execution: Arc<RwLock<()>>,
-}
-```
+这个设计的含义是：**模型被允许失败。** 它不需要第一次就做对。它可以试、可以错、可以调整。这比"失败就停"的 agent 灵活得多。
 
-关键设计：`parallel_execution` 是一个 `RwLock<()>`。
+## Ctrl+C 的两种处理方式
 
-- 支持并行的工具（如 `read`、`grep`）拿 **read lock**——多个可以同时执行
-- 不支持并行的工具（如 `shell`、`apply_patch`）拿 **write lock**——独占执行
+用户按了 Ctrl+C。此时 `cargo test` 正在跑，已经输出了 30 行日志。
 
-```rust
-// codex-rs/core/src/tools/parallel.rs:133
-let _guard = if supports_parallel {
-    Either::Left(lock.read().await)   // 并行工具：共享锁
-} else {
-    Either::Right(lock.write().await) // 串行工具：独占锁
-};
-router.dispatch_tool_call_with_terminal_outcome(...).await
-```
+系统面临一个选择：是立刻杀掉这个进程（丢失部分输出），还是给它一个机会优雅退出（收集已有输出）？
 
-这意味着：模型一次输出 3 个 `read` + 1 个 `shell`，3 个 read 并行执行，shell 等它们全部完成后再执行。不需要显式的调度器——RwLock 的语义天然表达了"读可以并发，写必须独占"。
+Codex 两种都做，取决于工具类型：
 
-## 中断处理：工具执行到一半用户按了 Ctrl+C
+- **shell 命令**：发 SIGTERM，等进程退出，收集部分输出。因为 shell 命令可能有子进程、可能写了临时文件，直接 abort 可能留下垃圾。
+- **纯计算工具**（比如内部的文本处理）：直接 abort tokio task。没有副作用，杀了就杀了。
 
-```rust
-// codex-rs/core/src/tools/parallel.rs:160
-tokio::select! {
-    res = &mut dispatch_handle => res?,
-    _ = cancellation_token.cancelled() => {
-        if wait_for_runtime_cancellation {
-            // 等工具自己优雅退出（如 shell 命令的 SIGTERM）
-            dispatch_handle.await?
-        } else {
-            // 直接 abort
-            dispatch_handle.abort();
-            notify_tool_aborted(...).await;
-        }
-    }
-}
-```
+这个区分由工具自己声明（`wait_for_runtime_cancellation`），不是调度器猜的。
 
-两种中断策略：
+## turn 循环只看到一个布尔值
 
-- `wait_for_runtime_cancellation = true`（shell 命令）：发 SIGTERM，等进程退出，收集部分输出
-- `wait_for_runtime_cancellation = false`（纯计算工具）：直接 abort tokio task
+说了这么多细节，但 turn 循环本身——ch01 里那个 `loop { ... }`——对这一切完全无感。它只看到一个布尔值：`needs_follow_up`。
 
-## 错误不中断循环
+`true` 意味着：模型输出了 tool call，工具已执行，结果已回注历史，需要再调一次模型。`false` 意味着：模型只输出了文本，turn 结束。
 
-工具执行失败不会杀 turn。错误被包装成 `FunctionCallError`，回注历史让模型自己决定下一步：
+并行门控、错误处理、中断策略——全部封装在 `run_sampling_request` 内部。Turn 循环不知道也不关心工具是怎么跑的。它只知道"模型还想继续"或者"模型说完了"。
 
-```rust
-// codex-rs/core/src/tools/parallel.rs:84
-match future.await {
-    Ok(response) => Ok(response.into_response()),
-    Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-    Err(other) => Ok(Self::failure_response(error_call, other)),
-    //          ↑ 非致命错误变成"工具返回了错误信息"，循环继续
-}
-```
-
-只有 `Fatal` 错误（比如沙箱崩溃）才会中断 turn。普通的"命令返回非零退出码""文件不存在"都是正常的工具输出，模型看到错误信息后可以自己调整策略。
-
-## 取舍
-
-**得到什么**：
-
-- 工具执行顺序有确定性——RwLock 保证写操作不会和任何操作并发
-- 中断是优雅的——不会留下半执行的 shell 命令
-- 错误是信息而非灾难——模型可以从工具失败中恢复
-
-**放弃什么**：
-
-- 所有写操作被串行化——即使模型想并行 apply 两个不冲突的 patch，也必须等
-- 每个 step 重建 ToolRouter——有少量重复计算开销
-- 中断逻辑分两种路径——增加了代码复杂度
-
-## 对读者的启示
-
-工具执行的核心设计决策不是"怎么调 handler"，而是**并行策略**。
-
-- 如果你全部串行：简单，但浪费了模型一次输出多个 tool call 的并行机会
-- 如果你全部并行：快，但两个 `apply_patch` 同时写同一个文件会冲突
-- Codex 的选择：用 RwLock 让工具自己声明"我能不能并行"，系统不做额外调度
-
-这个设计把并行决策权交给了工具定义者（写 handler 的人），而不是调度器。代价是每个工具必须正确声明自己的并行安全性。
+这种封装的好处是：你可以换掉整个工具执行层（比如换成远程执行、换成容器化执行），turn 循环一行不用改。坏处是：调试"为什么这个工具跑了 30 秒"时，你得穿透好几层抽象才能看到真相。
 
 ---
 
