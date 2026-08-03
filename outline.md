@@ -6,7 +6,7 @@
 
 不是源码导读，而是**设计取舍的解剖**。
 
-每一章回答一个设计问题，源码只在"为什么这样做"时出场。读者读完应该能回答：
+每一章回答一个设计问题，源码只在“为什么这样做”时出场。读者读完应该能回答：
 - Codex 做了哪些关键设计决策？
 - 每个决策放弃了什么、得到了什么？
 - 如果我要做类似系统，哪些可以直接借鉴，哪些需要根据场景变通？
@@ -21,7 +21,7 @@
 
 > **如何在沙箱安全约束下，让 LLM 拥有尽可能大的代码修改自主权？**
 
-Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → 上下文工程决定模型看到什么 → 工具系统决定模型能做什么 → 沙箱和 Guardian 决定边界在哪 → 多 agent 把自主权分治。这条线贯穿全书。
+Codex 的回答是一套“受控自主”架构：Session 管理生命周期 → 上下文工程决定模型看到什么 → 工具系统决定模型能做什么 → 沙箱和 Guardian 决定边界在哪 → 多 agent 把自主权分治。这条线贯穿全书。
 
 ---
 
@@ -42,7 +42,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 
 ### 1. Session 与 Turn：谁拥有生命周期
 
-- 设计问题：一个 coding agent 的"一次对话"应该由谁管理？
+- 设计问题：一个 coding agent 的“一次对话”应该由谁管理？
 - Session 拥有什么：config、conversation history、input queue、agent status
 - Turn 的边界：从 user input 到 terminal event（Completed/Errored/Interrupted）
 - 为什么 Session 和 Turn 必须分开：一个 Session 可以有多个 Turn，Turn 之间共享上下文
@@ -63,7 +63,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 
 ### 3. 工具执行循环：turn 里真正干活的部分
 
-- 设计问题：模型说"我要执行一个命令"，系统应该怎么响应？
+- 设计问题：模型说“我要执行一个命令”，系统应该怎么响应？
 - 工具调用的完整链路：spec 注册 → 模型输出 tool_call → handler 执行 → 结果回注
 - 并行 vs 串行工具调用
 - 工具执行不是插件调用——它是 turn 循环的一部分
@@ -75,7 +75,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 
 ## 第二篇：上下文工程
 
-> 核心问题：模型看到什么，决定了它能做什么。如何构造"刚好够用"的上下文？
+> 核心问题：模型看到什么，决定了它能做什么。如何构造“刚好够用”的上下文？
 
 ### 4. 上下文构造：一次 query 后模型看到了什么
 
@@ -93,7 +93,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - prompt cache 的命中条件：稳定前缀是必要条件，实际命中还受模型、breakpoint 和服务端路由影响
 - compaction 的触发时机和策略：token budget 超限 → 摘要压缩
 - 压缩时保留什么、丢弃什么
-- **取舍**：自动压缩是有损的，但"丢失细节"好过"context overflow 导致请求失败"
+- **取舍**：自动压缩是有损的，但“丢失细节”好过“context overflow 导致请求失败”
 
 配源码：`compact.rs`、`compact_token_budget.rs`、`session/context_window.rs`
 
@@ -118,7 +118,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - 设计问题：为什么不给 LLM 一个万能 bash 就够了？
 - 工具注册：spec（schema + description）→ handler（执行逻辑）
 - 核心工具：apply_patch、shell、read、write、web_search
-- 工具 spec 如何影响模型行为：description 是写给模型看的"使用手册"
+- 工具 spec 如何影响模型行为：description 是写给模型看的“使用手册”
 - **取舍**：结构化工具限制了模型的表达方式，但大幅降低了破坏性操作的概率
 
 配源码：`tools/handlers/apply_patch.rs`、`function_tool.rs`
@@ -131,7 +131,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - macOS：seatbelt (sandbox-exec)
 - Windows：独立的 windows-sandbox
 - 网络策略：默认禁止，白名单放行
-- **取舍**：沙箱限制了模型能做的事（不能装包、不能访问网络），但让"全自动执行"成为可能
+- **取舍**：沙箱限制了模型能做的事（不能装包、不能访问网络），但让“全自动执行”成为可能
 
 配源码：`sandboxing/` crate、`exec_policy.rs`、`unified_exec/`
 
@@ -141,13 +141,13 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 
 > 核心问题：沙箱之外的操作（写文件、网络请求）如何获得授权？
 
-### 9. Guardian：不是所有"能做的"都该做
+### 9. Guardian：不是所有“能做的”都该做
 
-- 设计问题：沙箱管不了的事（比如"这个 patch 该不该 apply"）谁来管？
+- 设计问题：沙箱管不了的事（比如“这个 patch 该不该 apply”）谁来管？
 - Guardian 的角色：在工具执行前做审批判断
 - approval request 的生命周期：请求 → 用户确认/拒绝 → 继续/中止
 - 自动审批 vs 人工审批的边界
-- **取舍**：审批增加了交互延迟，但让"半自动"模式成为可能——用户保持最终控制权
+- **取舍**：审批增加了交互延迟，但让“半自动”模式成为可能——用户保持最终控制权
 
 配源码：`guardian/mod.rs`、`guardian/approval_request.rs`、`tools/approvals.rs`
 
@@ -159,7 +159,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 
 ### 10. 角色与 Spawn：子 agent 是怎么来的
 
-- 设计问题：为什么需要多种"角色"而不是统一的一种 agent？
+- 设计问题：为什么需要多种“角色”而不是统一的一种 agent？
 - 角色的本质：写给父 agent 看的使用说明，不是子 agent 的行为约束
 - spawn 的两种模式：空白新建 vs fork 父上下文
 - V1 vs V2 协议的核心区别
@@ -174,7 +174,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - V2：Session 自身在 terminal turn 主动转发
 - 清理机制：显式 close、V2 LRU 驱逐、注册表释放
 - 注入内容无独立过期，依赖 compaction 统一处理
-- **取舍**：不做精细的"通知过期"，依赖已有 compaction 机制——简单但粗糙
+- **取舍**：不做精细的“通知过期”，依赖已有 compaction 机制——简单但粗糙
 
 配源码：`session/mod.rs:1801`、`agent/control/residency.rs`、`agent/control/legacy.rs`
 
@@ -189,7 +189,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - 设计问题：为什么 skill 是 markdown 文件而不是插件代码？
 - skill 的发现、选择、注入流程
 - skill 没有运行时能力，但它零依赖、人类可审计
-- **取舍**：skill 不能调 API、不能改行为，但它让"教 agent 做事"变成了"写文档"
+- **取舍**：skill 不能调 API、不能改行为，但它让“教 agent 做事”变成了“写文档”
 
 配源码：`skills.rs`、`codex-rs/skills/`
 
@@ -208,7 +208,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - 配置优先级：CLI flag > 项目 config > 全局 config > 默认值
 - AGENTS.md 的发现和拼接
 - permission profile：预定义的权限组合
-- **取舍**：多层配置增加了心智负担，但让"全局默认 + 项目定制"成为可能
+- **取舍**：多层配置增加了心智负担，但让“全局默认 + 项目定制”成为可能
 
 配源码：`config/mod.rs`、`agents_md.rs`、`config/permissions.rs`
 
@@ -249,7 +249,7 @@ ch01-session-turn ═══> ch02-model-call ═══> ch03-tool-loop ═══
 
 ## 写作规则
 
-1. **每章以设计问题开头** — 不是"这个模块有什么"，而是"为什么要这样设计"
+1. **每章以设计问题开头** — 不是“这个模块有什么”，而是“为什么要这样设计”
 2. **每个关键决策标注取舍** — 得到什么、放弃什么
 3. **源码只在需要时出场** — 代码块不超过 40 行，只展示设计核心
 4. **中文写作，术语保留英文** — 如 session, turn, tool call, compaction, sandbox

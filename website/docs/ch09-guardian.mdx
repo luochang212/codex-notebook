@@ -14,7 +14,7 @@ sidebar_label: 9. Guardian 审批机制
 
 ## Guardian：一个专门做判断的模型
 
-Codex 的解法是引入一个独立的 guardian 模型。它不做代码修改，不执行命令——它只做一件事：看到待审批的操作 + 用户意图 + 最近的操作历史，然后回答"这个操作符合用户意图吗？"
+Codex 的解法是引入一个独立的 guardian 模型。它不做代码修改，不执行命令——它只做一件事：看到待审批的操作 + 用户意图 + 最近的操作历史，然后回答“这个操作符合用户意图吗？”
 
 ```mermaid
 flowchart TD
@@ -56,7 +56,7 @@ pub(crate) const MAX_RECENT_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 10;
 pub(crate) const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
 ```
 
-注意：熔断的结果是 **abort turn**，不是"升级给用户"。系统发送一条 GuardianWarning，然后中断当前 Turn。用户看到的是 turn 被终止，而不是一个"是否继续"的弹框。
+注意：熔断的结果是 **abort turn**，不是“升级给用户”。系统发送一条 GuardianWarning，然后中断当前 Turn。用户看到的是 turn 被终止，而不是一个“是否继续”的弹框。
 
 ## Guardian 管什么？
 
@@ -68,7 +68,7 @@ pub(crate) const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
 - McpToolCall（MCP 工具调用）
 - RequestPermissions（权限请求）
 
-Guardian 处理的是灰色地带：**技术上允许，但需要判断是否合理。**"能不能做"由沙箱和 exec policy 硬拦截；"该不该做"由 guardian 软判断。
+Guardian 处理的是灰色地带：**技术上允许，但需要判断是否合理。**“能不能做”由沙箱和 exec policy 硬拦截；“该不该做”由 guardian 软判断。
 
 ## 代价
 
@@ -80,9 +80,9 @@ Guardian 处理的是灰色地带：**技术上允许，但需要判断是否合
 
 ## 回到审批疲劳
 
-现在你能理解 guardian 的位置了。它不能替代沙箱（那是硬边界），但它直接参与高风险操作的审批决策——fail-closed、风险评估、熔断中断都是安全行为。同时它也是体验机制：让"安全"和"不打扰用户"可以同时成立。
+现在你能理解 guardian 的位置了。它不能替代沙箱（那是硬边界），但它直接参与高风险操作的审批决策——fail-closed、风险评估、熔断中断都是安全行为。同时它也是体验机制：让“安全”和“不打扰用户”可以同时成立。
 
-没有 guardian，宽松的 approval policy 要么不安全（全放行），要么不可用（全审批）。有了 guardian，大部分"安全但需要确认"的操作被自动处理，只有真正可疑的才会中断 turn。
+没有 guardian，宽松的 approval policy 要么不安全（全放行），要么不可用（全审批）。有了 guardian，大部分“安全但需要确认”的操作被自动处理，只有真正可疑的才会中断 turn。
 
 ---
 
