@@ -34,15 +34,28 @@ Codex 的做法是：把当前全部对话历史发给模型，让它写一段�
 
 用户看到的是什么？一条警告："长线程和多次压缩可能降低准确性，建议开新线程。"然后模型继续干活。它不会说"上下文快满了，我来压缩一下"。它只是继续。
 
-## 压缩重置了 prompt cache
+## 压缩没有换 key，但改写了可匹配前缀
 
-这里有一个隐性成本，和 ch04 直接相关。
+这里有一个隐性成本，和 ch04 直接相关。先说一个容易混淆的事实：**compaction 不会给 session 换一个新的 `prompt_cache_key`。**普通 Responses 请求默认使用 session ID 作为 key，远程 compaction 请求也从同一套请求构造逻辑中取出并继续发送这个 key。
 
-压缩前，对话历史的前缀（base instructions + world state baseline）是稳定的，prompt cache 可以持续复用。压缩后，旧历史被摘要替代，baseline 重建——前缀变了。下一次请求的 cache 命中情况取决于服务端缓存策略。
+变化的是 key 所对应的 prompt 内容。压缩前，请求携带原始历史：用户消息、模型回复、tool call、tool result 和逐步追加的 context diff。压缩后，active history 被 replacement history 取代：旧控制流不再逐项出现，摘要和保留下来的用户消息成为新的会话主体。即使 key 相同，缓存断点处的精确前缀也已经不同。
 
-但新的 baseline 一旦建立，后续请求的前缀又稳定了，cache 重新积累。
+所以不能简单地说“压缩把缓存清空了”。Codex 客户端没有权限清空推理服务器上的 KV cache，旧条目也可能仍在保留期内。准确的说法是：**压缩改写了下一次请求用于匹配的前缀，旧缓存对新请求通常不再直接适用。**具体命中多少，取决于服务端的 breakpoint、路由、保留时间和淘汰状态。
 
-这是一个有意识的取舍：压缩后前缀变化带来的 cache 成本，远低于模型因为上下文不连贯而犯错的代价。如果只截断前面而不重置 baseline，cache 前缀不变，但模型看到的上下文是断裂的——摘要和旧 baseline 对不上。Codex 选了"贵一次但连贯"，而不是"便宜但精神分裂"。
+新的 canonical initial context 和 world state baseline 建立后，后续 diff 仍然只向尾部追加，系统重新获得一个稳定前缀。这里的取舍不是“是否保住同一 cache key”，而是“是否保住旧历史的逐项结构”：Codex 放弃后者，换取足够小且内部一致的新窗口。
+
+如果强行只从头部删除若干消息，确实可能暂时少生成一段摘要，但模型拿到的会是一条缺少因果起点的工具执行链。某个 tool result 可能还在，它对应的 tool call 却已经被删掉；某项修改仍被后文引用，做出修改的约束却消失了。Codex 宁愿承担新前缀的 prefill 成本，也不把这种结构断裂交给模型继续猜。
+
+## 缓存和记忆解决的不是同一个问题
+
+Prompt cache 容易让人误以为系统“已经记住了旧对话”。实际上，KV cache 只是一次前向计算的中间结果；它减少重复计算，却不决定哪些事实进入模型当前可见的语义上下文。即使旧 KV 条目仍存在，只要新请求的缓存条件不匹配，模型就无法借此恢复被 compaction 删除的细节。
+
+Compaction 做的恰恰相反：它不追求无损保存计算状态，而是重新编码语义。旧历史中的几十条消息被压成一段摘要，计算上需要形成新的缓存前缀，语义上却尽量保留“接下来还需要知道什么”。因此两者的失败方式也不同：
+
+- cache miss 的后果是多做 prefill、增加延迟或费用，模型仍然能看到完整输入；
+- compaction 遗漏的后果是事实从 active history 中消失，后续模型可能据此做错决定。
+
+这解释了为什么 Codex 会分别记录两类信息。`TokenUsage` 中的 `cached_input_tokens` 和 `cache_write_input_tokens` 用来观察计算复用；`RolloutItem::Compacted` 和 replacement history 用来恢复压缩后的语义状态。前者是性能账，后者才是会话记忆账。
 
 ## 摘要质量是软肋
 
@@ -59,7 +72,7 @@ Codex 支持本地压缩和远程压缩：
 - **本地**：用当前模型做摘要，消耗本地 token budget
 - **远程**：provider 支持时，压缩在服务端完成。客户端仍记录这次调用的 token usage，但具体计费策略由产品决定
 
-远程压缩的优势是不占用客户端的 context window 来做摘要。但不是所有 provider 都支持。
+远程压缩的优势是由 provider 的专用 endpoint 完成历史压缩，但不是所有 provider 都支持。它仍然要接收待压缩的输入，也可能产生 cached input 和 cache write usage；“远程”描述的是执行位置和接口，不代表这次操作没有上下文计算成本。
 
 ## 回到那个下午四点
 
@@ -71,4 +84,4 @@ Codex 支持本地压缩和远程压缩：
 
 ---
 
-源码快照：`openai/codex` @ `841e47b8fb`（`codex-rs/core/src/compact.rs`、`compact_token_budget.rs`、`session/context_window.rs`、`session/turn.rs`）
+源码快照：`openai/codex` @ `841e47b8fb113a201b68e0f1f5790ba22836a241`（`codex-rs/core/src/compact.rs`、`core/src/client.rs`、`core/src/session/mod.rs`、`protocol/src/protocol.rs`）

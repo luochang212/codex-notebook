@@ -90,7 +90,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 ### 5. 缓存与压缩：把无限对话装进有限窗口
 
 - 设计问题：用户和 agent 聊了 200 轮，context window 装不下了
-- prompt cache 的命中条件：前缀不变才能命中
+- prompt cache 的命中条件：稳定前缀是必要条件，实际命中还受模型、breakpoint 和服务端路由影响
 - compaction 的触发时机和策略：token budget 超限 → 摘要压缩
 - 压缩时保留什么、丢弃什么
 - **取舍**：自动压缩是有损的，但"丢失细节"好过"context overflow 导致请求失败"
@@ -102,7 +102,7 @@ Codex 的回答是一套"受控自主"架构：Session 管理生命周期 → �
 - 设计问题：环境信息（git status、子 agent 列表、时间）每步都变，怎么高效记录？
 - baseline/diff 机制：首次全量，后续只记变化
 - WorldState 的组成：git info、subagent list、time reminder、hook context
-- 为什么不用每步全量：token 浪费 + 破坏 prompt cache 前缀
+- 为什么不用每步全量：token 浪费 + 主动改写可复用的 prompt cache 前缀
 - **取舍**：增量记录增加了实现复杂度，但保护了缓存命中率和 token 预算
 
 配源码：`context_manager/history.rs` 的 baseline/diff、`session/world_state.rs`
